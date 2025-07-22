@@ -1429,9 +1429,13 @@ fi
 )
 AC_SUBST(FUSE_LIB)
 AC_SUBST(FUSE_CMT)
+AC_SUBST(FUSE4_CMT)
+dnl fuse4fs requires FUSE 3.0+
+FUSE4_CMT="#"
 if test "$FUSE_LIB" = "-lfuse3"
 then
 	FUSE_USE_VERSION=35
+	FUSE4_CMT=
 	CFLAGS="$fuse3_CFLAGS $CFLAGS"
 	FUSE_LIB="$fuse3_LIBS"
 	AC_CHECK_HEADERS([pthread.h fuse.h], [],

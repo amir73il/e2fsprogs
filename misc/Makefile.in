@@ -35,7 +35,7 @@ MKDIR_P = @MKDIR_P@
 @BLKID_CMT@FINDFS_MAN= findfs.8
 
 @FUSE_CMT@FUSE_PROG= fuse2fs
-@FUSE_CMT@FUSE4_PROG= fuse4fs
+@FUSE4_CMT@FUSE4_PROG= fuse4fs
 
 SPROGS=		mke2fs badblocks tune2fs dumpe2fs $(BLKID_PROG) logsave \
 			$(E2IMAGE_PROG) @FSCK_PROG@ e2undo
@@ -74,7 +74,7 @@ E4CRYPT_OBJS=   e4crypt.o
 E2FREEFRAG_OBJS= e2freefrag.o
 E2FUZZ_OBJS=	e2fuzz.o
 FUSE2FS_OBJS=	fuse2fs.o journal.o recovery.o revoke.o
-FUSE4FS_OBJS=	fuse4fs.o journal.o recovery.o revoke.o
+@FUSE4_CMT@FUSE4FS_OBJS=	fuse4fs.o journal.o recovery.o revoke.o
 
 PROFILED_TUNE2FS_OBJS=	profiled/tune2fs.o profiled/util.o profiled/journal.o \
 				profiled/recovery.o profiled/revoke.o
@@ -431,12 +431,12 @@ fuse2fs: $(FUSE2FS_OBJS) $(DEPLIBS) $(DEPLIBBLKID) $(DEPLIBUUID) \
 		$(LIBFUSE) $(LIBBLKID) $(LIBUUID) $(LIBEXT2FS) $(LIBINTL) \
 		$(CLOCK_GETTIME_LIB) $(SYSLIBS) $(LIBS_E2P)
 
-fuse4fs: $(FUSE4FS_OBJS) $(DEPLIBS) $(DEPLIBBLKID) $(DEPLIBUUID) \
-		$(LIBEXT2FS) $(DEPLIBS_E2P)
-	$(E) "	LD $@"
-	$(Q) $(CC) $(ALL_LDFLAGS) -o fuse4fs $(FUSE4FS_OBJS) $(LIBS) \
-		$(LIBFUSE) $(LIBBLKID) $(LIBUUID) $(LIBEXT2FS) $(LIBINTL) \
-		$(CLOCK_GETTIME_LIB) $(SYSLIBS) $(LIBS_E2P)
+@FUSE4_CMT@fuse4fs: $(FUSE4FS_OBJS) $(DEPLIBS) $(DEPLIBBLKID) $(DEPLIBUUID) \
+@FUSE4_CMT@		$(LIBEXT2FS) $(DEPLIBS_E2P)
+@FUSE4_CMT@	$(E) "	LD $@"
+@FUSE4_CMT@	$(Q) $(CC) $(ALL_LDFLAGS) -o fuse4fs $(FUSE4FS_OBJS) $(LIBS) \
+@FUSE4_CMT@		$(LIBFUSE) $(LIBBLKID) $(LIBUUID) $(LIBEXT2FS) $(LIBINTL) \
+@FUSE4_CMT@		$(CLOCK_GETTIME_LIB) $(SYSLIBS) $(LIBS_E2P)
 
 journal.o: $(srcdir)/../debugfs/journal.c
 	$(E) "	CC $<"
@@ -890,15 +890,18 @@ fuse2fs.o: $(srcdir)/fuse2fs.c $(top_builddir)/lib/config.h \
  $(top_srcdir)/lib/ext2fs/bitops.h $(top_srcdir)/lib/ext2fs/ext2fsP.h \
  $(top_srcdir)/lib/ext2fs/ext2fs.h $(top_srcdir)/version.h \
  $(top_srcdir)/lib/e2p/e2p.h
-fuse4fs.o: $(srcdir)/fuse4fs.c $(top_builddir)/lib/config.h \
- $(top_builddir)/lib/dirpaths.h $(top_srcdir)/lib/ext2fs/ext2fs.h \
- $(top_builddir)/lib/ext2fs/ext2_types.h $(top_srcdir)/lib/ext2fs/ext2_fs.h \
- $(top_srcdir)/lib/ext2fs/ext3_extents.h $(top_srcdir)/lib/et/com_err.h \
- $(top_srcdir)/lib/ext2fs/ext2_io.h $(top_builddir)/lib/ext2fs/ext2_err.h \
- $(top_srcdir)/lib/ext2fs/ext2_ext_attr.h $(top_srcdir)/lib/ext2fs/hashmap.h \
- $(top_srcdir)/lib/ext2fs/bitops.h $(top_srcdir)/lib/ext2fs/ext2fsP.h \
- $(top_srcdir)/lib/ext2fs/ext2fs.h $(top_srcdir)/version.h \
- $(top_srcdir)/lib/e2p/e2p.h
+@FUSE4_CMT@fuse4fs.o: $(srcdir)/fuse4fs.c $(top_builddir)/lib/config.h \
+@FUSE4_CMT@ $(top_builddir)/lib/dirpaths.h $(top_srcdir)/lib/ext2fs/ext2fs.h \
+@FUSE4_CMT@ $(top_builddir)/lib/ext2fs/ext2_types.h $(top_srcdir)/lib/ext2fs/ext2_fs.h \
+@FUSE4_CMT@ $(top_srcdir)/lib/ext2fs/ext3_extents.h $(top_srcdir)/lib/et/com_err.h \
+@FUSE4_CMT@ $(top_srcdir)/lib/ext2fs/ext2_io.h $(top_builddir)/lib/ext2fs/ext2_err.h \
+@FUSE4_CMT@ $(top_srcdir)/lib/ext2fs/ext2_ext_attr.h $(top_srcdir)/lib/ext2fs/hashmap.h \
+@FUSE4_CMT@ $(top_srcdir)/lib/ext2fs/bitops.h $(top_srcdir)/lib/ext2fs/ext2fsP.h \
+@FUSE4_CMT@ $(top_srcdir)/lib/ext2fs/ext2fs.h $(top_srcdir)/version.h \
+@FUSE4_CMT@ $(top_srcdir)/lib/e2p/e2p.h
+@FUSE4_CMT@	$(E) "	CC $<"
+@FUSE4_CMT@	$(Q) $(CC) -c $(ALL_CFLAGS) -Wunused-function $< -o $@
+@FUSE4_CMT@@PROFILE_CMT@	$(Q) $(CC) $(ALL_CFLAGS) -Wunused-function -g -pg -o profiled/$*.o -c $<
 e2fuzz.o: $(srcdir)/e2fuzz.c $(top_builddir)/lib/config.h \
  $(top_builddir)/lib/dirpaths.h $(top_srcdir)/lib/ext2fs/ext2_fs.h \
  $(top_builddir)/lib/ext2fs/ext2_types.h $(top_srcdir)/lib/ext2fs/ext2fs.h \
