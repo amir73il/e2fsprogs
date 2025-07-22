@@ -230,6 +230,8 @@ static int __translate_error(ext2_filsys fs, ext2_ino_t ino, errcode_t err,
 #define translate_error(fs, ino, err) __translate_error((fs), (ino), (err), \
 			__FILE__, __LINE__)
 
+
+
 /* for macosx */
 #ifndef W_OK
 #  define W_OK 2
@@ -856,30 +858,30 @@ static int stat_inode(ext2_filsys fs, ext2_ino_t ino, struct stat *statbuf)
 	return ret;
 }
 
-static int op_getattr(const char *path, struct stat *statbuf,
-		      struct fuse_file_info *fi EXT2FS_ATTR((unused)))
+static void op_getattr(fuse_req_t req, fuse_ino_t fino,
+		       struct fuse_file_info *fi EXT2FS_ATTR((unused)))
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t ino;
-	errcode_t err;
+	ext2_ino_t ino = (ext2_ino_t)fino;
+	struct stat statbuf;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	dbg_printf(ff, "%s: path=%s\n", __func__, path);
+	dbg_printf(ff, "%s: ino=%d\n", __func__, ino);
 	pthread_mutex_lock(&ff->bfl);
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
-	if (err) {
-		ret = translate_error(fs, 0, err);
-		goto out;
-	}
-	ret = stat_inode(fs, ino, statbuf);
-out:
+	ret = stat_inode(fs, ino, &statbuf);
 	pthread_mutex_unlock(&ff->bfl);
-	return ret;
+
+	if (ret)
+		fuse_reply_err(req, -ret);
+	else
+		fuse_reply_attr(req, &statbuf, 0.0);
 }
+
+
 
 static void op_readlink(fuse_req_t req, fuse_ino_t fino)
 {
@@ -1966,40 +1968,18 @@ static int in_file_group(struct fuse_context *ctxt,
 	return 0;
 }
 
-static int op_chmod(const char *path, mode_t mode,
-		    struct fuse_file_info *fi EXT2FS_ATTR((unused)))
+static int do_chmod(struct fuse2fs *ff, ext2_ino_t ino, mode_t mode,
+		   struct ext2_inode_large *inode)
 {
 	struct fuse_context *ctxt = fuse_get_context();
-	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
-	ext2_filsys fs;
-	errcode_t err;
-	ext2_ino_t ino;
-	struct ext2_inode_large inode;
-	int ret = 0;
+	int ret;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
-	fs = ff->fs;
-	pthread_mutex_lock(&ff->bfl);
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
-	if (err) {
-		ret = translate_error(fs, 0, err);
-		goto out;
-	}
-	dbg_printf(ff, "%s: path=%s mode=0%o ino=%d\n", __func__, path, mode, ino);
-
-	err = fuse2fs_read_inode(fs, ino, &inode);
-	if (err) {
-		ret = translate_error(fs, ino, err);
-		goto out;
-	}
-
-	ret = check_iflags_access(ff, ino, EXT2_INODE(&inode), W_OK);
+	ret = check_iflags_access(ff, ino, EXT2_INODE(inode), W_OK);
 	if (ret)
-		goto out;
+		return ret;
 
-	if (want_check_owner(ff, ctxt) && ctxt->uid != inode_uid(inode)) {
-		ret = -EPERM;
-		goto out;
+	if (want_check_owner(ff, ctxt) && ctxt->uid != inode_uid(*inode)) {
+		return -EPERM;
 	}
 
 	/*
@@ -2008,105 +1988,56 @@ static int op_chmod(const char *path, mode_t mode,
 	 * group.
 	 */
 	if (!is_superuser(ff, ctxt)) {
-		ret = in_file_group(ctxt, &inode);
+		ret = in_file_group(ctxt, inode);
 		if (ret < 0)
-			goto out;
-
+			return ret;
 		if (!ret)
 			mode &= ~S_ISGID;
 	}
 
-	inode.i_mode &= ~0xFFF;
-	inode.i_mode |= mode & 0xFFF;
+	inode->i_mode &= ~0xFFF;
+	inode->i_mode |= mode & 0xFFF;
 
-	dbg_printf(ff, "%s: path=%s new_mode=0%o ino=%d\n", __func__,
-		   path, inode.i_mode, ino);
+	dbg_printf(ff, "%s: setting mode to 0%o\n", __func__, inode->i_mode);
 
-	ret = update_ctime(fs, ino, &inode);
-	if (ret)
-		goto out;
-
-	err = fuse2fs_write_inode(fs, ino, &inode);
-	if (err) {
-		ret = translate_error(fs, ino, err);
-		goto out;
-	}
-
-out:
-	pthread_mutex_unlock(&ff->bfl);
-	return ret;
+	return 0;
 }
 
-static int op_chown(const char *path, uid_t owner, gid_t group,
-		    struct fuse_file_info *fi EXT2FS_ATTR((unused)))
+static int do_chown(struct fuse2fs *ff, ext2_ino_t ino, uid_t owner, gid_t group,
+		    struct ext2_inode_large *inode)
 {
 	struct fuse_context *ctxt = fuse_get_context();
-	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
-	ext2_filsys fs;
-	errcode_t err;
-	ext2_ino_t ino;
-	struct ext2_inode_large inode;
-	int ret = 0;
+	int ret;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
-	fs = ff->fs;
-	pthread_mutex_lock(&ff->bfl);
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
-	if (err) {
-		ret = translate_error(fs, 0, err);
-		goto out;
-	}
-	dbg_printf(ff, "%s: path=%s owner=%d group=%d ino=%d\n", __func__,
-		   path, owner, group, ino);
-
-	err = fuse2fs_read_inode(fs, ino, &inode);
-	if (err) {
-		ret = translate_error(fs, ino, err);
-		goto out;
-	}
-
-	ret = check_iflags_access(ff, ino, EXT2_INODE(&inode), W_OK);
+	ret = check_iflags_access(ff, ino, EXT2_INODE(inode), W_OK);
 	if (ret)
-		goto out;
+		return ret;
 
 	/* FUSE seems to feed us ~0 to mean "don't change" */
 	if (owner != (uid_t) ~0) {
 		/* Only root gets to change UID. */
 		if (want_check_owner(ff, ctxt) &&
-		    !(inode_uid(inode) == ctxt->uid && owner == ctxt->uid)) {
-			ret = -EPERM;
-			goto out;
+		    !(inode_uid(*inode) == ctxt->uid && owner == ctxt->uid)) {
+			return -EPERM;
 		}
-		inode.i_uid = owner;
-		ext2fs_set_i_uid_high(inode, owner >> 16);
+		inode->i_uid = owner;
+		ext2fs_set_i_uid_high(*inode, owner >> 16);
+		dbg_printf(ff, "%s: setting uid to %u\n", __func__, owner);
 	}
 
 	if (group != (gid_t) ~0) {
 		/* Only root or the owner get to change GID. */
-		if (want_check_owner(ff, ctxt) &&
-		    inode_uid(inode) != ctxt->uid) {
-			ret = -EPERM;
-			goto out;
+		if (want_check_owner(ff, ctxt) && inode_uid(*inode) != ctxt->uid) {
+			return -EPERM;
 		}
 
 		/* XXX: We /should/ check group membership but FUSE */
-		inode.i_gid = group;
-		ext2fs_set_i_gid_high(inode, group >> 16);
+		inode->i_gid = group;
+		ext2fs_set_i_gid_high(*inode, group >> 16);
+		dbg_printf(ff, "%s: setting gid to %u\n", __func__, group);
 	}
 
-	ret = update_ctime(fs, ino, &inode);
-	if (ret)
-		goto out;
-
-	err = fuse2fs_write_inode(fs, ino, &inode);
-	if (err) {
-		ret = translate_error(fs, ino, err);
-		goto out;
-	}
-
-out:
-	pthread_mutex_unlock(&ff->bfl);
-	return ret;
+	return 0;
 }
 
 static int punch_posteof(struct fuse2fs *ff, ext2_ino_t ino, off_t new_size)
@@ -2176,41 +2107,20 @@ out_close:
 	return 0;
 }
 
-static int op_truncate(const char *path, off_t len,
-		       struct fuse_file_info *fi EXT2FS_ATTR((unused)))
-{
-	struct fuse_context *ctxt = fuse_get_context();
-	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
-	ext2_filsys fs;
-	ext2_ino_t ino;
-	errcode_t err;
-	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
-	fs = ff->fs;
-	pthread_mutex_lock(&ff->bfl);
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
-	if (err) {
-		ret = translate_error(fs, 0, err);
-		goto out;
-	}
-	if (!ino) {
-		ret = -ESTALE;
-		goto out;
-	}
+
+static int do_truncate(struct fuse2fs *ff, ext2_ino_t ino, off_t len)
+{
+	int ret;
+
 	dbg_printf(ff, "%s: ino=%d len=%jd\n", __func__, ino, (intmax_t) len);
 
 	ret = check_inum_access(ff, ino, W_OK);
 	if (ret)
-		goto out;
+		return ret;
 
 	ret = truncate_helper(ff, ino, len);
-	if (ret)
-		goto out;
-
-out:
-	pthread_mutex_unlock(&ff->bfl);
-	return err;
+	return ret;
 }
 
 #ifdef __linux__
@@ -3176,27 +3086,13 @@ out:
 
 
 
-static int op_utimens(const char *path, const struct timespec ctv[2],
-		      struct fuse_file_info *fi EXT2FS_ATTR((unused)))
+static int do_utimens(struct fuse2fs *ff, ext2_ino_t ino, const struct timespec ctv[2],
+		      struct ext2_inode_large *inode)
 {
-	struct fuse_context *ctxt = fuse_get_context();
-	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	struct timespec tv[2];
-	ext2_filsys fs;
-	errcode_t err;
-	ext2_ino_t ino;
-	struct ext2_inode_large inode;
 	int access = W_OK;
-	int ret = 0;
+	int ret;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
-	fs = ff->fs;
-	pthread_mutex_lock(&ff->bfl);
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
-	if (err) {
-		ret = translate_error(fs, 0, err);
-		goto out;
-	}
 	dbg_printf(ff, "%s: ino=%d atime=%lld.%ld mtime=%lld.%ld\n", __func__,
 			ino,
 			(long long int)ctv[0].tv_sec, ctv[0].tv_nsec,
@@ -3210,13 +3106,7 @@ static int op_utimens(const char *path, const struct timespec ctv[2],
 		access |= A_OK;
 	ret = check_inum_access(ff, ino, access);
 	if (ret)
-		goto out;
-
-	err = fuse2fs_read_inode(fs, ino, &inode);
-	if (err) {
-		ret = translate_error(fs, ino, err);
-		goto out;
-	}
+		return ret;
 
 	tv[0] = ctv[0];
 	tv[1] = ctv[1];
@@ -3228,23 +3118,11 @@ static int op_utimens(const char *path, const struct timespec ctv[2],
 #endif /* UTIME_NOW */
 #ifdef UTIME_OMIT
 	if (tv[0].tv_nsec != UTIME_OMIT)
-		EXT4_INODE_SET_XTIME(i_atime, &tv[0], &inode);
+		EXT4_INODE_SET_XTIME(i_atime, &tv[0], inode);
 	if (tv[1].tv_nsec != UTIME_OMIT)
-		EXT4_INODE_SET_XTIME(i_mtime, &tv[1], &inode);
+		EXT4_INODE_SET_XTIME(i_mtime, &tv[1], inode);
 #endif /* UTIME_OMIT */
-	ret = update_ctime(fs, ino, &inode);
-	if (ret)
-		goto out;
-
-	err = fuse2fs_write_inode(fs, ino, &inode);
-	if (err) {
-		ret = translate_error(fs, ino, err);
-		goto out;
-	}
-
-out:
-	pthread_mutex_unlock(&ff->bfl);
-	return ret;
+	return 0;
 }
 
 #define FUSE2FS_MODIFIABLE_IFLAGS \
@@ -3618,6 +3496,118 @@ static void op_ioctl(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 	}
 }
 
+static void op_setattr(fuse_req_t req, fuse_ino_t fino, struct stat *attr,
+		       int to_set, struct fuse_file_info *fi EXT2FS_ATTR((unused)))
+{
+	struct fuse_context *ctxt = fuse_get_context();
+	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
+	ext2_filsys fs;
+	ext2_ino_t ino = (ext2_ino_t)fino;
+	struct ext2_inode_large inode;
+	struct stat statbuf;
+	struct timespec tv[2];
+	errcode_t err;
+	int ret = 0;
+
+	FUSE4FS_CHECK_CONTEXT(ff, req);
+	fs = ff->fs;
+	dbg_printf(ff, "%s: ino=%d to_set=0x%x\n", __func__, ino, to_set);
+	pthread_mutex_lock(&ff->bfl);
+
+	err = fuse2fs_read_inode(fs, ino, &inode);
+	if (err) {
+		ret = translate_error(fs, ino, err);
+		goto out;
+	}
+
+	/* Handle mode change using helper */
+	if (to_set & FUSE_SET_ATTR_MODE) {
+		ret = do_chmod(ff, ino, attr->st_mode, &inode);
+		if (ret)
+			goto out;
+	}
+
+	/* Handle owner/group change using helper */
+	if (to_set & (FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID)) {
+		uid_t owner = (to_set & FUSE_SET_ATTR_UID) ? attr->st_uid : (uid_t)~0;
+		gid_t group = (to_set & FUSE_SET_ATTR_GID) ? attr->st_gid : (gid_t)~0;
+
+		ret = do_chown(ff, ino, owner, group, &inode);
+		if (ret)
+			goto out;
+	}
+
+	/* Handle size change using helper */
+	if (to_set & FUSE_SET_ATTR_SIZE) {
+		off_t new_size = attr->st_size;
+
+		if (!fs_writeable(fs)) {
+			ret = -EROFS;
+			goto out;
+		}
+
+		ret = do_truncate(ff, ino, new_size);
+		if (ret)
+			goto out;
+
+		/* Re-read inode after truncate */
+		err = fuse2fs_read_inode(fs, ino, &inode);
+		if (err) {
+			ret = translate_error(fs, ino, err);
+			goto out;
+		}
+	}
+
+	/* Handle time changes using helper */
+	if (to_set & (FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME)) {
+		if (to_set & FUSE_SET_ATTR_ATIME) {
+			tv[0].tv_sec = attr->st_atime;
+			tv[0].tv_nsec = 0;
+#if HAVE_STRUCT_STAT_ST_ATIM
+			tv[0] = attr->st_atim;
+#endif
+		} else {
+			EXT4_INODE_GET_XTIME(i_atime, &tv[0], &inode);
+		}
+
+		if (to_set & FUSE_SET_ATTR_MTIME) {
+			tv[1].tv_sec = attr->st_mtime;
+			tv[1].tv_nsec = 0;
+#if HAVE_STRUCT_STAT_ST_ATIM
+			tv[1] = attr->st_mtim;
+#endif
+		} else {
+			EXT4_INODE_GET_XTIME(i_mtime, &tv[1], &inode);
+		}
+
+		ret = do_utimens(ff, ino, tv, &inode);
+		if (ret)
+			goto out;
+	}
+
+	/* Update ctime for any attribute change */
+	ret = update_ctime(fs, ino, &inode);
+	if (ret)
+		goto out;
+
+	err = fuse2fs_write_inode(fs, ino, &inode);
+	if (err) {
+		ret = translate_error(fs, ino, err);
+		goto out;
+	}
+
+	/* Get updated stat info to return */
+	ret = stat_inode(fs, ino, &statbuf);
+
+out:
+	pthread_mutex_unlock(&ff->bfl);
+
+	if (ret)
+		fuse_reply_err(req, -ret);
+	else
+		fuse_reply_attr(req, &statbuf, 1.0);
+}
+
 static int op_bmap(const char *path, size_t blocksize EXT2FS_ATTR((unused)),
 		   uint64_t *idx)
 {
@@ -3896,6 +3886,8 @@ out:
 # endif /* SUPPORT_FALLOCATE */
 
 static struct fuse_lowlevel_ops ll_ops = {
+	.getattr = op_getattr,
+	.setattr = op_setattr,
 	.mkdir = op_mkdir,
 	.mknod = op_mknod,
 	.link = op_link,
@@ -3921,10 +3913,6 @@ static struct fuse_lowlevel_ops ll_ops = {
 static struct fuse_operations fs_ops = {
 	.init = op_init,
 	.destroy = op_destroy,
-	.getattr = op_getattr,
-	.chmod = op_chmod,
-	.chown = op_chown,
-	.truncate = op_truncate,
 	.open = op_open,
 	.read = op_read,
 	.write = op_write,
@@ -3933,7 +3921,6 @@ static struct fuse_operations fs_ops = {
 	.readdir = op_readdir,
 	.access = op_access,
 	.create = op_create,
-	.utimens = op_utimens,
 	.bmap = op_bmap,
 };
 
@@ -4319,7 +4306,7 @@ int main(int argc, char *argv[])
 
 	/* Set up default fuse parameters */
 	snprintf(extra_args, BUFSIZ, "-okernel_cache,subtype=%s,"
-		 "fsname=%s,attr_timeout=0",
+		 "fsname=%s",
 		 get_subtype(argv[0]),
 		 fctx.device);
 	if (fctx.no_default_opts == 0)
