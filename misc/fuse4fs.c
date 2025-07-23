@@ -230,7 +230,21 @@ static int __translate_error(ext2_filsys fs, ext2_ino_t ino, errcode_t err,
 #define translate_error(fs, ino, err) __translate_error((fs), (ino), (err), \
 			__FILE__, __LINE__)
 
+/* Convert FUSE inode number to ext2 inode number */
+static inline ext2_ino_t fuse_to_ext2_ino(fuse_ino_t fino)
+{
+	if (fino == FUSE_ROOT_ID)
+		return EXT2_ROOT_INO;
+	return (ext2_ino_t)fino;
+}
 
+/* Convert ext2 inode number to FUSE inode number */
+static inline fuse_ino_t ext2_to_fuse_ino(ext2_ino_t ino)
+{
+	if (ino == EXT2_ROOT_INO)
+		return FUSE_ROOT_ID;
+	return (fuse_ino_t)ino;
+}
 
 /* for macosx */
 #ifndef W_OK
@@ -852,13 +866,53 @@ static int stat_inode(ext2_filsys fs, ext2_ino_t ino, struct stat *statbuf)
 	return ret;
 }
 
+static void op_lookup(fuse_req_t req, fuse_ino_t pino, const char *name)
+{
+	struct fuse_context *ctxt = fuse_get_context();
+	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
+	ext2_filsys fs;
+	ext2_ino_t parent = fuse_to_ext2_ino(pino);
+	ext2_ino_t child;
+	struct fuse_entry_param e;
+	errcode_t err;
+	int ret = 0;
+
+	FUSE4FS_CHECK_CONTEXT(ff, req);
+	fs = ff->fs;
+	dbg_printf(ff, "%s: parent=%d name=%s\n", __func__, parent, name);
+	pthread_mutex_lock(&ff->bfl);
+
+	err = ext2fs_namei(fs, EXT2_ROOT_INO, parent, name, &child);
+	if (err || child == 0) {
+		ret = translate_error(fs, 0, err);
+		goto out;
+	}
+
+	ret = stat_inode(fs, child, &e.attr);
+	if (ret)
+		goto out;
+
+	e.ino = ext2_to_fuse_ino(child);
+	e.generation = e.attr.st_ino; /* Use inode number as generation for now */
+	e.attr_timeout = 0.0;
+	e.entry_timeout = 0.0;
+
+out:
+	pthread_mutex_unlock(&ff->bfl);
+
+	if (ret)
+		fuse_reply_err(req, -ret);
+	else
+		fuse_reply_entry(req, &e);
+}
+
 static void op_getattr(fuse_req_t req, fuse_ino_t fino,
 		       struct fuse_file_info *fi EXT2FS_ATTR((unused)))
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t ino = (ext2_ino_t)fino;
+	ext2_ino_t ino = fuse_to_ext2_ino(fino);
 	struct stat statbuf;
 	int ret = 0;
 
@@ -883,7 +937,7 @@ static void op_readlink(fuse_req_t req, fuse_ino_t fino)
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
 	errcode_t err;
-	ext2_ino_t ino = (ext2_ino_t)fino;
+	ext2_ino_t ino = fuse_to_ext2_ino(fino);
 	struct ext2_inode inode;
 	unsigned int got;
 	ext2_file_t file;
@@ -1070,7 +1124,7 @@ static void op_mknod(fuse_req_t req, fuse_ino_t pino, const char *name,
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t child, parent = (ext2_ino_t)pino;
+	ext2_ino_t child, parent = fuse_to_ext2_ino(pino);
 	errcode_t err;
 	int filetype;
 	struct ext2_inode_large inode;
@@ -1170,7 +1224,7 @@ static void op_mkdir(fuse_req_t req, fuse_ino_t pino, const char *name,
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t child, parent = (ext2_ino_t)pino;
+	ext2_ino_t child, parent = fuse_to_ext2_ino(pino);
 	errcode_t err;
 	struct ext2_inode_large inode;
 	char *block;
@@ -1418,7 +1472,7 @@ static void op_unlink(fuse_req_t req, fuse_ino_t pino, const char *name)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
-	ext2_ino_t parent = (ext2_ino_t)pino;
+	ext2_ino_t parent = fuse_to_ext2_ino(pino);
 	int ret;
 
 	FUSE4FS_CHECK_CONTEXT(ff, req);
@@ -1548,7 +1602,7 @@ static void op_rmdir(fuse_req_t req, fuse_ino_t pino, const char *name)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
-	ext2_ino_t parent = (ext2_ino_t)pino;
+	ext2_ino_t parent = fuse_to_ext2_ino(pino);
 	int ret;
 
 	FUSE4FS_CHECK_CONTEXT(ff, req);
@@ -1564,7 +1618,7 @@ static void op_symlink(fuse_req_t req, const char *src, fuse_ino_t pino,
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t child, parent = (ext2_ino_t)pino;
+	ext2_ino_t child, parent = fuse_to_ext2_ino(pino);
 	errcode_t err;
 	struct ext2_inode_large inode;
 	int ret = 0;
@@ -1664,8 +1718,8 @@ static void op_rename(fuse_req_t req, fuse_ino_t from_parent, const char *from,
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
 	errcode_t err;
-	ext2_ino_t from_ino, from_dir_ino = (ext2_ino_t)from_parent;
-	ext2_ino_t to_ino, to_dir_ino = (ext2_ino_t)to_parent;
+	ext2_ino_t from_ino, from_dir_ino = fuse_to_ext2_ino(from_parent);
+	ext2_ino_t to_ino, to_dir_ino = fuse_to_ext2_ino(to_parent);
 	struct ext2_inode inode;
 	struct update_dotdot ud;
 	int ret = 0;
@@ -1846,8 +1900,8 @@ static void op_link(fuse_req_t req, fuse_ino_t src_ino, fuse_ino_t pino,
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
 	errcode_t err;
-	ext2_ino_t parent = (ext2_ino_t)pino;
-	ext2_ino_t ino = (ext2_ino_t)src_ino;
+	ext2_ino_t parent = fuse_to_ext2_ino(pino);
+	ext2_ino_t ino = fuse_to_ext2_ino(src_ino);
 	struct ext2_inode_large inode;
 	int ret = 0;
 
@@ -2222,7 +2276,7 @@ static void op_open(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fp)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
-	ext2_ino_t ino = (ext2_ino_t)fino;
+	ext2_ino_t ino = fuse_to_ext2_ino(fino);
 	int ret;
 
 	FUSE4FS_CHECK_CONTEXT(ff, req);
@@ -2522,7 +2576,7 @@ static void op_getxattr(fuse_req_t req, fuse_ino_t fino, const char *key,
 	ext2_filsys fs;
 	void *ptr = NULL;
 	size_t plen;
-	ext2_ino_t ino = (ext2_ino_t) fino;
+	ext2_ino_t ino = fuse_to_ext2_ino(fino);
 	errcode_t err;
 	int ret = 0;
 
@@ -2599,7 +2653,7 @@ static void op_listxattr(fuse_req_t req, fuse_ino_t fino, size_t len)
 	struct ext2_xattr_handle *h;
 	char *names = NULL;
 	unsigned int bufsz;
-	ext2_ino_t ino = (ext2_ino_t) fino;
+	ext2_ino_t ino = fuse_to_ext2_ino(fino);
 	errcode_t err;
 	int ret = 0;
 
@@ -2680,7 +2734,7 @@ static void op_setxattr(fuse_req_t req, fuse_ino_t fino, const char *key,
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
 	struct ext2_xattr_handle *h;
-	ext2_ino_t ino = (ext2_ino_t) fino;
+	ext2_ino_t ino = fuse_to_ext2_ino(fino);
 	errcode_t err;
 	int ret = 0;
 
@@ -2772,7 +2826,7 @@ static void op_removexattr(fuse_req_t req, fuse_ino_t fino, const char *key)
 	struct ext2_xattr_handle *h;
 	void *buf;
 	size_t buflen;
-	ext2_ino_t ino = (ext2_ino_t) fino;
+	ext2_ino_t ino = fuse_to_ext2_ino(fino);
 	errcode_t err;
 	int ret = 0;
 
@@ -2941,7 +2995,7 @@ static void op_readdir(fuse_req_t req, fuse_ino_t fino, size_t size,
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	struct fuse2fs_file_handle *fh =
 		(struct fuse2fs_file_handle *)(uintptr_t)fp->fh;
-	ext2_ino_t ino = (ext2_ino_t)fino;
+	ext2_ino_t ino = fuse_to_ext2_ino(fino);
 	errcode_t err;
 	struct readdir_iter i;
 	char *buf;
@@ -2997,7 +3051,7 @@ static void op_access(fuse_req_t req, fuse_ino_t fino, int mask)
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t ino = (ext2_ino_t)fino;
+	ext2_ino_t ino = fuse_to_ext2_ino(fino);
 	int ret = 0;
 
 	FUSE4FS_CHECK_CONTEXT(ff, req);
@@ -3017,7 +3071,7 @@ static void op_create(fuse_req_t req, fuse_ino_t pino, const char *name,
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t parent = (ext2_ino_t)pino, child;
+	ext2_ino_t parent = fuse_to_ext2_ino(pino), child;
 	struct fuse_entry_param e;
 	struct stat statbuf;
 	errcode_t err;
@@ -3545,7 +3599,7 @@ static void op_setattr(fuse_req_t req, fuse_ino_t fino, struct stat *attr,
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t ino = (ext2_ino_t)fino;
+	ext2_ino_t ino = fuse_to_ext2_ino(fino);
 	struct ext2_inode_large inode;
 	struct stat statbuf;
 	struct timespec tv[2];
@@ -3657,7 +3711,7 @@ static void op_bmap(fuse_req_t req, fuse_ino_t fino,
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t ino = (ext2_ino_t)fino;
+	ext2_ino_t ino = fuse_to_ext2_ino(fino);
 	errcode_t err;
 	int ret = 0;
 
@@ -3929,6 +3983,7 @@ out:
 static struct fuse_lowlevel_ops ll_ops = {
 	.init = op_init,
 	.destroy = op_destroy,
+	.lookup = op_lookup,
 	.getattr = op_getattr,
 	.setattr = op_setattr,
 	.mkdir = op_mkdir,
