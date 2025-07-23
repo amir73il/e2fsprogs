@@ -2138,7 +2138,7 @@ static void detect_linux_executable_open(int kernel_flags, int *access_check,
 }
 #endif /* __linux__ */
 
-static int __op_open(struct fuse2fs *ff, const char *path,
+static int __op_open(struct fuse2fs *ff, ext2_ino_t ino,
 		     struct fuse_file_info *fp)
 {
 	ext2_filsys fs = ff->fs;
@@ -2146,11 +2146,12 @@ static int __op_open(struct fuse2fs *ff, const char *path,
 	struct fuse2fs_file_handle *file;
 	int check = 0, ret = 0;
 
-	dbg_printf(ff, "%s: path=%s oflags=0o%o\n", __func__, path, fp->flags);
+	dbg_printf(ff, "%s: ino=%d oflags=0o%o\n", __func__, ino, fp->flags);
 	err = ext2fs_get_mem(sizeof(*file), &file);
 	if (err)
 		return translate_error(fs, 0, err);
 	file->magic = FUSE2FS_FILE_MAGIC;
+	file->ino = ino;
 
 	file->open_flags = 0;
 	switch (fp->flags & O_ACCMODE) {
@@ -2181,11 +2182,6 @@ static int __op_open(struct fuse2fs *ff, const char *path,
 	if (fp->flags & O_CREAT)
 		file->open_flags |= EXT2_FILE_CREATE;
 
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &file->ino);
-	if (err || file->ino == 0) {
-		ret = translate_error(fs, 0, err);
-		goto out;
-	}
 	dbg_printf(ff, "%s: ino=%d\n", __func__, file->ino);
 
 	ret = check_inum_access(ff, file->ino, check);
@@ -2214,6 +2210,7 @@ static int __op_open(struct fuse2fs *ff, const char *path,
 	}
 
 	fp->fh = (uintptr_t)file;
+	fp->keep_cache = 1;
 
 out:
 	if (ret)
@@ -2221,17 +2218,22 @@ out:
 	return ret;
 }
 
-static int op_open(const char *path, struct fuse_file_info *fp)
+static void op_open(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fp)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
+	ext2_ino_t ino = (ext2_ino_t)fino;
 	int ret;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	pthread_mutex_lock(&ff->bfl);
-	ret = __op_open(ff, path, fp);
+	ret = __op_open(ff, ino, fp);
 	pthread_mutex_unlock(&ff->bfl);
-	return ret;
+
+	if (ret)
+		fuse_reply_err(req, -ret);
+	else
+		fuse_reply_open(req, fp);
 }
 
 static int op_read(const char *path EXT2FS_ATTR((unused)), char *buf,
@@ -2951,35 +2953,23 @@ static void op_access(fuse_req_t req, fuse_ino_t fino, int mask)
 	fuse_reply_err(req, -ret);
 }
 
-static int op_create(const char *path, mode_t mode, struct fuse_file_info *fp)
+static void op_create(fuse_req_t req, fuse_ino_t pino, const char *name,
+		      mode_t mode, struct fuse_file_info *fp)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t parent, child;
-	char *temp_path;
+	ext2_ino_t parent = (ext2_ino_t)pino, child;
+	struct fuse_entry_param e;
+	struct stat statbuf;
 	errcode_t err;
-	char *node_name, a;
 	int filetype;
 	struct ext2_inode_large inode;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	dbg_printf(ff, "%s: path=%s mode=0%o\n", __func__, path, mode);
-	temp_path = strdup(path);
-	if (!temp_path) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	node_name = strrchr(temp_path, '/');
-	if (!node_name) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	node_name++;
-	a = *node_name;
-	*node_name = 0;
+	dbg_printf(ff, "%s: name=%s mode=0%o\n", __func__, name, mode);
 
 	pthread_mutex_lock(&ff->bfl);
 	if (!fs_can_allocate(ff, 1)) {
@@ -2987,18 +2977,9 @@ static int op_create(const char *path, mode_t mode, struct fuse_file_info *fp)
 		goto out2;
 	}
 
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, temp_path,
-			   &parent);
-	if (err) {
-		ret = translate_error(fs, 0, err);
-		goto out2;
-	}
-
 	ret = check_inum_access(ff, parent, A_OK | W_OK);
 	if (ret)
 		goto out2;
-
-	*node_name = a;
 
 	filetype = ext2_file_type(mode);
 
@@ -3009,8 +2990,8 @@ static int op_create(const char *path, mode_t mode, struct fuse_file_info *fp)
 	}
 
 	dbg_printf(ff, "%s: creating ino=%d/name=%s in dir=%d\n", __func__, child,
-		   node_name, parent);
-	err = ext2fs_link(fs, parent, node_name, child,
+		   name, parent);
+	err = ext2fs_link(fs, parent, name, child,
 			  filetype | EXT2FS_LINK_EXPAND);
 	if (err) {
 		ret = translate_error(fs, parent, err);
@@ -3064,14 +3045,28 @@ static int op_create(const char *path, mode_t mode, struct fuse_file_info *fp)
 	if (ret)
 		goto out2;
 
-	ret = __op_open(ff, path, fp);
+	ret = __op_open(ff, child, fp);
 	if (ret)
 		goto out2;
+
 out2:
 	pthread_mutex_unlock(&ff->bfl);
-out:
-	free(temp_path);
-	return ret;
+
+	if (!ret) {
+		/* Get stat info for the new file */
+		ret = stat_inode(fs, child, &statbuf);
+	}
+	if (ret) {
+		fuse_reply_err(req, -ret);
+		return;
+	}
+
+	e.ino = child;
+	e.generation = inode.i_generation;
+	e.attr_timeout = 0.0;
+	e.entry_timeout = 0.0;
+	e.attr = statbuf;
+	fuse_reply_create(req, &e, fp);
 }
 
 
@@ -3890,6 +3885,9 @@ static struct fuse_lowlevel_ops ll_ops = {
 	.getxattr = op_getxattr,
 	.listxattr = op_listxattr,
 	.removexattr = op_removexattr,
+	.open = op_open,
+	.opendir = op_open,
+	.create = op_create,
 	.release = op_release,
 	.releasedir = op_release,
 	.fsync = op_fsync,
@@ -3904,12 +3902,9 @@ static struct fuse_lowlevel_ops ll_ops = {
 };
 
 static struct fuse_operations fs_ops = {
-	.open = op_open,
 	.read = op_read,
 	.write = op_write,
-	.opendir = op_open,
 	.readdir = op_readdir,
-	.create = op_create,
 };
 
 static int get_random_bytes(void *p, size_t sz)
@@ -4293,8 +4288,7 @@ int main(int argc, char *argv[])
 	get_random_bytes(&fctx.next_generation, sizeof(unsigned int));
 
 	/* Set up default fuse parameters */
-	snprintf(extra_args, BUFSIZ, "-okernel_cache,subtype=%s,"
-		 "fsname=%s",
+	snprintf(extra_args, BUFSIZ, "-osubtype=%s,fsname=%s",
 		 get_subtype(argv[0]),
 		 fctx.device);
 	if (fctx.no_default_opts == 0)
