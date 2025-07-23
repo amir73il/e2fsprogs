@@ -4017,9 +4017,6 @@ static struct fuse_lowlevel_ops ll_ops = {
 #endif
 };
 
-static struct fuse_operations fs_ops = {
-};
-
 static int get_random_bytes(void *p, size_t sz)
 {
 	int fd;
@@ -4129,8 +4126,8 @@ static int fuse2fs_opt_proc(void *data, const char *arg,
 	"\n",
 			outargs->argv[0]);
 		if (key == FUSE2FS_HELPFULL) {
-			fuse_opt_add_arg(outargs, "-h");
-			fuse_main(outargs->argc, outargs->argv, &fs_ops, NULL);
+			fprintf(stderr, "FUSE options:\n");
+			fuse_cmdline_help();
 		} else {
 			fprintf(stderr, "Try --helpfull to get a list of "
 				"all flags, including the FUSE options.\n");
@@ -4140,8 +4137,7 @@ static int fuse2fs_opt_proc(void *data, const char *arg,
 	case FUSE2FS_VERSION:
 		fprintf(stderr, "fuse4fs %s (%s)\n", E2FSPROGS_VERSION,
 			E2FSPROGS_DATE);
-		fuse_opt_add_arg(outargs, "--version");
-		fuse_main(outargs->argc, outargs->argv, &fs_ops, NULL);
+		printf("FUSE library version %s\n", fuse_pkgversion());
 		exit(0);
 	}
 	return 1;
@@ -4183,6 +4179,67 @@ static unsigned long long default_cache_size(void)
 		if (max_cache > 0 && ret > max_cache)
 			ret = max_cache;
 	}
+	return ret;
+}
+
+static int main_ll(struct fuse_args *args, struct fuse2fs *fctx)
+{
+	struct fuse_cmdline_opts opts;
+	struct fuse_session *se;
+	int ret;
+
+	if (fuse_parse_cmdline(args, &opts) != 0) {
+		ret = 1;
+		goto out;
+	}
+
+	if (opts.show_help) {
+		fuse_cmdline_help();
+		ret = 0;
+		goto out_free_opts;
+	}
+
+	if (opts.show_version) {
+		printf("FUSE library version %s\n", fuse_pkgversion());
+		ret = 0;
+		goto out_free_opts;
+	}
+
+	if (!opts.mountpoint) {
+		fprintf(stderr, "error: no mountpoint specified\n");
+		ret = 1;
+		goto out_free_opts;
+	}
+
+	se = fuse_session_new(args, &ll_ops, sizeof(ll_ops), fctx);
+	if (se == NULL) {
+		ret = 3;
+		goto out_free_opts;
+	}
+
+	if (fuse_set_signal_handlers(se) != 0) {
+		ret = 3;
+		goto out_destroy_session;
+	}
+
+	if (fuse_session_mount(se, opts.mountpoint) != 0) {
+		ret = 3;
+		goto out_remove_signal_handlers;
+	}
+
+	ret = fuse_daemonize(opts.foreground);
+	if (!ret)
+		ret = fuse_session_loop(se);
+
+	fuse_session_unmount(se);
+
+out_remove_signal_handlers:
+	fuse_remove_signal_handlers(se);
+out_destroy_session:
+	fuse_session_destroy(se);
+out_free_opts:
+	free(opts.mountpoint);
+out:
 	return ret;
 }
 
@@ -4443,7 +4500,7 @@ int main(int argc, char *argv[])
 	}
 
 	pthread_mutex_init(&fctx.bfl, NULL);
-	ret = fuse_main(args.argc, args.argv, &fs_ops, &fctx);
+	ret = main_ll(&args, &fctx);
 	pthread_mutex_destroy(&fctx.bfl);
 
 	switch(ret) {
