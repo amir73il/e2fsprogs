@@ -762,17 +762,15 @@ static void op_destroy(void *p EXT2FS_ATTR((unused)))
 	}
 }
 
-static void *op_init(struct fuse_conn_info *conn,
-		     struct fuse_config *cfg EXT2FS_ATTR((unused)))
+static void op_init(void *userdata, struct fuse_conn_info *conn)
 {
-	struct fuse_context *ctxt = fuse_get_context();
-	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
+	struct fuse2fs *ff = (struct fuse2fs *)userdata;
 	ext2_filsys fs;
 	errcode_t err;
 
 	if (ff->magic != FUSE2FS_MAGIC) {
 		translate_error(global_fs, 0, EXT2_ET_BAD_MAGIC);
-		return NULL;
+		return;
 	}
 	fs = ff->fs;
 	dbg_printf(ff, "%s: dev=%s\n", __func__, fs->device_name);
@@ -784,9 +782,6 @@ static void *op_init(struct fuse_conn_info *conn,
 		conn->want |= FUSE_CAP_POSIX_ACL;
 #endif
 	conn->time_gran = 1;
-	cfg->use_ino = 1;
-	if (ff->debug)
-		cfg->debug = 1;
 	if (fs->flags & EXT2_FLAG_RW) {
 		fs->super->s_mnt_count++;
 		ext2fs_set_tstamp(fs->super, s_mtime, time(NULL));
@@ -803,7 +798,6 @@ static void *op_init(struct fuse_conn_info *conn,
 		uuid_unparse(fs->super->s_uuid, uuid);
 		log_printf(ff, "%s %s.\n", _("mounted filesystem"), uuid);
 	}
-	return ff;
 }
 
 static int stat_inode(ext2_filsys fs, ext2_ino_t ino, struct stat *statbuf)
@@ -2427,20 +2421,22 @@ static void op_fsync(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 	fuse_reply_err(req, -ret);
 }
 
-static int op_statfs(const char *path EXT2FS_ATTR((unused)),
-		     struct statvfs *buf)
+static void op_statfs(fuse_req_t req, fuse_ino_t ino EXT2FS_ATTR((unused)))
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
 	uint64_t fsid, *f;
 	blk64_t overhead, reserved, free;
+	struct statvfs buf;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	dbg_printf(ff, "%s: path=%s\n", __func__, path);
-	buf->f_bsize = fs->blocksize;
-	buf->f_frsize = 0;
+	dbg_printf(ff, "%s: ino=%lu\n", __func__, (unsigned long)ino);
+	pthread_mutex_lock(&ff->bfl);
+
+	buf.f_bsize = fs->blocksize;
+	buf.f_frsize = 0;
 
 	if (ff->minixdf)
 		overhead = 0;
@@ -2453,27 +2449,30 @@ static int op_statfs(const char *path EXT2FS_ATTR((unused)),
 		reserved = ext2fs_blocks_count(fs->super) / 10;
 	free = ext2fs_free_blocks_count(fs->super);
 
-	buf->f_blocks = ext2fs_blocks_count(fs->super) - overhead;
-	buf->f_bfree = free;
+	buf.f_blocks = ext2fs_blocks_count(fs->super) - overhead;
+	buf.f_bfree = free;
 	if (free < reserved)
-		buf->f_bavail = 0;
+		buf.f_bavail = 0;
 	else
-		buf->f_bavail = free - reserved;
-	buf->f_files = fs->super->s_inodes_count;
-	buf->f_ffree = fs->super->s_free_inodes_count;
-	buf->f_favail = fs->super->s_free_inodes_count;
+		buf.f_bavail = free - reserved;
+	buf.f_files = fs->super->s_inodes_count;
+	buf.f_ffree = fs->super->s_free_inodes_count;
+	buf.f_favail = fs->super->s_free_inodes_count;
 	f = (uint64_t *)fs->super->s_uuid;
 	fsid = *f;
 	f++;
 	fsid ^= *f;
-	buf->f_fsid = fsid;
-	buf->f_flag = 0;
+	buf.f_fsid = fsid;
+	buf.f_flag = 0;
 	if (fs->flags & EXT2_FLAG_RW)
-		buf->f_flag |= ST_RDONLY;
-	buf->f_namemax = EXT2_NAME_LEN;
+		buf.f_flag |= ST_RDONLY;
+	buf.f_namemax = EXT2_NAME_LEN;
 
-	return 0;
+	pthread_mutex_unlock(&ff->bfl);
+	fuse_reply_statfs(req, &buf);
 }
+
+
 
 static const char *valid_xattr_prefixes[] = {
 	"user.",
@@ -2933,32 +2932,23 @@ out:
 	return ret;
 }
 
-static int op_access(const char *path, int mask)
+static void op_access(fuse_req_t req, fuse_ino_t fino, int mask)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	errcode_t err;
-	ext2_ino_t ino;
+	ext2_ino_t ino = (ext2_ino_t)fino;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	dbg_printf(ff, "%s: path=%s mask=0x%x\n", __func__, path, mask);
+	dbg_printf(ff, "%s: ino=%d mask=0x%x\n", __func__, ino, mask);
 	pthread_mutex_lock(&ff->bfl);
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
-	if (err || ino == 0) {
-		ret = translate_error(fs, 0, err);
-		goto out;
-	}
 
 	ret = check_inum_access(ff, ino, mask);
-	if (ret)
-		goto out;
 
-out:
 	pthread_mutex_unlock(&ff->bfl);
-	return ret;
+	fuse_reply_err(req, -ret);
 }
 
 static int op_create(const char *path, mode_t mode, struct fuse_file_info *fp)
@@ -3608,27 +3598,22 @@ out:
 		fuse_reply_attr(req, &statbuf, 1.0);
 }
 
-static int op_bmap(const char *path, size_t blocksize EXT2FS_ATTR((unused)),
-		   uint64_t *idx)
+static void op_bmap(fuse_req_t req, fuse_ino_t fino,
+		    size_t blocksize EXT2FS_ATTR((unused)), uint64_t idx)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t ino;
+	ext2_ino_t ino = (ext2_ino_t)fino;
 	errcode_t err;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
 	pthread_mutex_lock(&ff->bfl);
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
-	if (err) {
-		ret = translate_error(fs, 0, err);
-		goto out;
-	}
-	dbg_printf(ff, "%s: ino=%d blk=%"PRIu64"\n", __func__, ino, *idx);
+	dbg_printf(ff, "%s: ino=%d blk=%"PRIu64"\n", __func__, ino, idx);
 
-	err = ext2fs_bmap2(fs, ino, NULL, NULL, 0, *idx, 0, (blk64_t *)idx);
+	err = ext2fs_bmap2(fs, ino, NULL, NULL, 0, idx, 0, (blk64_t *)&idx);
 	if (err) {
 		ret = translate_error(fs, ino, err);
 		goto out;
@@ -3636,7 +3621,10 @@ static int op_bmap(const char *path, size_t blocksize EXT2FS_ATTR((unused)),
 
 out:
 	pthread_mutex_unlock(&ff->bfl);
-	return ret;
+	if (ret)
+		fuse_reply_err(req, -ret);
+	else
+		fuse_reply_bmap(req, idx);
 }
 
 # ifdef SUPPORT_FALLOCATE
@@ -3886,6 +3874,8 @@ out:
 # endif /* SUPPORT_FALLOCATE */
 
 static struct fuse_lowlevel_ops ll_ops = {
+	.init = op_init,
+	.destroy = op_destroy,
 	.getattr = op_getattr,
 	.setattr = op_setattr,
 	.mkdir = op_mkdir,
@@ -3905,23 +3895,21 @@ static struct fuse_lowlevel_ops ll_ops = {
 	.fsync = op_fsync,
 	.fsyncdir = op_fsync,
 	.ioctl = op_ioctl,
+	.statfs = op_statfs,
+	.access = op_access,
+	.bmap = op_bmap,
 #ifdef SUPPORT_FALLOCATE
 	.fallocate = op_fallocate,
 #endif
 };
 
 static struct fuse_operations fs_ops = {
-	.init = op_init,
-	.destroy = op_destroy,
 	.open = op_open,
 	.read = op_read,
 	.write = op_write,
-	.statfs = op_statfs,
 	.opendir = op_open,
 	.readdir = op_readdir,
-	.access = op_access,
 	.create = op_create,
-	.bmap = op_bmap,
 };
 
 static int get_random_bytes(void *p, size_t sz)
@@ -4314,6 +4302,9 @@ int main(int argc, char *argv[])
 
 	if (fctx.ro)
 		fuse_opt_add_arg(&args, "-oro");
+
+	if (fctx.debug)
+		fuse_opt_add_arg(&args, "-odebug");
 
 	if (fctx.fakeroot) {
 #ifdef HAVE_MOUNT_NODEV
