@@ -220,6 +220,11 @@ struct fuse2fs {
 	return; \
 }} while (0)
 
+#define FUSE4FS_CHECK_FH(fs, ptr, req) do {if ((ptr)->magic != FUSE2FS_FILE_MAGIC) { \
+	fuse_reply_err(req, -translate_error((fs), 0, EXT2_ET_FILESYSTEM_CORRUPTED)); \
+	return; \
+}} while (0)
+
 static int __translate_error(ext2_filsys fs, ext2_ino_t ino, errcode_t err,
 			     const char *file, int line);
 #define translate_error(fs, ino, err) __translate_error((fs), (ino), (err), \
@@ -2455,8 +2460,8 @@ out:
 	return got ? (int) got : ret;
 }
 
-static int op_release(const char *path EXT2FS_ATTR((unused)),
-		      struct fuse_file_info *fp)
+static void op_release(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
+		       struct fuse_file_info *fp)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
@@ -2466,9 +2471,9 @@ static int op_release(const char *path EXT2FS_ATTR((unused)),
 	errcode_t err;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	FUSE2FS_CHECK_MAGIC(fs, fh, FUSE2FS_FILE_MAGIC);
+	FUSE4FS_CHECK_FH(fs, fh, req);
 	dbg_printf(ff, "%s: ino=%d\n", __func__, fh->ino);
 	pthread_mutex_lock(&ff->bfl);
 	if (fs_writeable(fs) && fh->open_flags & EXT2_FILE_WRITE) {
@@ -2481,12 +2486,12 @@ static int op_release(const char *path EXT2FS_ATTR((unused)),
 
 	ext2fs_free_mem(&fh);
 
-	return ret;
+	fuse_reply_err(req, -ret);
 }
 
-static int op_fsync(const char *path EXT2FS_ATTR((unused)),
-		    int datasync EXT2FS_ATTR((unused)),
-		    struct fuse_file_info *fp)
+static void op_fsync(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
+		     int datasync EXT2FS_ATTR((unused)),
+		     struct fuse_file_info *fp)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
@@ -2496,9 +2501,9 @@ static int op_fsync(const char *path EXT2FS_ATTR((unused)),
 	errcode_t err;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	FUSE2FS_CHECK_MAGIC(fs, fh, FUSE2FS_FILE_MAGIC);
+	FUSE4FS_CHECK_FH(fs, fh, req);
 	dbg_printf(ff, "%s: ino=%d\n", __func__, fh->ino);
 	/* For now, flush everything, even if it's slow */
 	pthread_mutex_lock(&ff->bfl);
@@ -2509,7 +2514,7 @@ static int op_fsync(const char *path EXT2FS_ATTR((unused)),
 	}
 	pthread_mutex_unlock(&ff->bfl);
 
-	return ret;
+	fuse_reply_err(req, -ret);
 }
 
 static int op_statfs(const char *path EXT2FS_ATTR((unused)),
@@ -3275,7 +3280,7 @@ static int ioctl_getflags(struct fuse2fs *ff, struct fuse2fs_file_handle *fh,
 }
 
 static int ioctl_setflags(struct fuse2fs *ff, struct fuse2fs_file_handle *fh,
-			  void *data)
+			  const void *data)
 {
 	ext2_filsys fs = ff->fs;
 	errcode_t err;
@@ -3326,7 +3331,7 @@ static int ioctl_getversion(struct fuse2fs *ff, struct fuse2fs_file_handle *fh,
 }
 
 static int ioctl_setversion(struct fuse2fs *ff, struct fuse2fs_file_handle *fh,
-			    void *data)
+			    const void *data)
 {
 	ext2_filsys fs = ff->fs;
 	errcode_t err;
@@ -3425,14 +3430,14 @@ static __u32 fsxflags_to_iflags(__u32 xflags)
 }
 
 static int ioctl_fssetxattr(struct fuse2fs *ff, struct fuse2fs_file_handle *fh,
-			    void *data)
+			    const void *data)
 {
 	ext2_filsys fs = ff->fs;
 	errcode_t err;
 	struct ext2_inode_large inode;
 	int ret;
 	struct fuse_context *ctxt = fuse_get_context();
-	struct fsxattr *fsx = data;
+	const struct fsxattr *fsx = data;
 	__u32 flags = fsxflags_to_iflags(fsx->fsx_xflags);
 	unsigned int inode_size;
 
@@ -3537,46 +3542,50 @@ out:
 }
 #endif /* FITRIM */
 
-static int op_ioctl(const char *path EXT2FS_ATTR((unused)),
-		    unsigned int cmd,
-		    void *arg EXT2FS_ATTR((unused)),
-		    struct fuse_file_info *fp,
-		    unsigned int flags EXT2FS_ATTR((unused)), void *data)
+static void op_ioctl(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
+		     unsigned int cmd,
+		     void *arg EXT2FS_ATTR((unused)),
+		     struct fuse_file_info *fp,
+		     unsigned int flags EXT2FS_ATTR((unused)),
+		     const void *in_buf, size_t in_bufsz EXT2FS_ATTR((unused)),
+		     size_t out_bufsz EXT2FS_ATTR((unused)))
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	struct fuse2fs_file_handle *fh =
 		(struct fuse2fs_file_handle *)(uintptr_t)fp->fh;
 	int ret = 0;
+	__u32 get_data;
+	struct fsxattr fsx_data;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	pthread_mutex_lock(&ff->bfl);
 	switch ((unsigned long) cmd) {
 #ifdef SUPPORT_I_FLAGS
 	case EXT2_IOC_GETFLAGS:
-		ret = ioctl_getflags(ff, fh, data);
+		ret = ioctl_getflags(ff, fh, &get_data);
 		break;
 	case EXT2_IOC_SETFLAGS:
-		ret = ioctl_setflags(ff, fh, data);
+		ret = ioctl_setflags(ff, fh, in_buf);
 		break;
 	case EXT2_IOC_GETVERSION:
-		ret = ioctl_getversion(ff, fh, data);
+		ret = ioctl_getversion(ff, fh, &get_data);
 		break;
 	case EXT2_IOC_SETVERSION:
-		ret = ioctl_setversion(ff, fh, data);
+		ret = ioctl_setversion(ff, fh, in_buf);
 		break;
 #endif
 #ifdef FS_IOC_FSGETXATTR
 	case FS_IOC_FSGETXATTR:
-		ret = ioctl_fsgetxattr(ff, fh, data);
+		ret = ioctl_fsgetxattr(ff, fh, &fsx_data);
 		break;
 	case FS_IOC_FSSETXATTR:
-		ret = ioctl_fssetxattr(ff, fh, data);
+		ret = ioctl_fssetxattr(ff, fh, in_buf);
 		break;
 #endif
 #ifdef FITRIM
 	case FITRIM:
-		ret = ioctl_fitrim(ff, fh, data);
+		ret = ioctl_fitrim(ff, fh, (void *)in_buf);
 		break;
 #endif
 	default:
@@ -3585,7 +3594,28 @@ static int op_ioctl(const char *path EXT2FS_ATTR((unused)),
 	}
 	pthread_mutex_unlock(&ff->bfl);
 
-	return ret;
+	if (ret) {
+		fuse_reply_err(req, -ret);
+	} else {
+		/* For successful operations, handle output data */
+		switch ((unsigned long) cmd) {
+#ifdef SUPPORT_I_FLAGS
+		case EXT2_IOC_GETFLAGS:
+		case EXT2_IOC_GETVERSION:
+			fuse_reply_ioctl(req, 0, &get_data, sizeof(__u32));
+			break;
+#endif
+#ifdef FS_IOC_FSGETXATTR
+		case FS_IOC_FSGETXATTR:
+			fuse_reply_ioctl(req, 0, &fsx_data, sizeof(struct fsxattr));
+			break;
+#endif
+		default:
+			/* For SET operations and others, just reply success */
+			fuse_reply_ioctl(req, 0, NULL, 0);
+			break;
+		}
+	}
 }
 
 static int op_bmap(const char *path, size_t blocksize EXT2FS_ATTR((unused)),
@@ -3832,9 +3862,9 @@ static int zero_helper(struct fuse_file_info *fp, int mode, off_t offset,
 	return ret;
 }
 
-static int op_fallocate(const char *path EXT2FS_ATTR((unused)), int mode,
-			off_t offset, off_t len,
-			struct fuse_file_info *fp)
+static void op_fallocate(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)), int mode,
+			 off_t offset, off_t len,
+			 struct fuse_file_info *fp)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
@@ -3842,8 +3872,10 @@ static int op_fallocate(const char *path EXT2FS_ATTR((unused)), int mode,
 	int ret;
 
 	/* Catch unknown flags */
-	if (mode & ~(FL_ZERO_RANGE_FLAG | FL_PUNCH_HOLE_FLAG | FL_KEEP_SIZE_FLAG))
-		return -EOPNOTSUPP;
+	if (mode & ~(FL_ZERO_RANGE_FLAG | FL_PUNCH_HOLE_FLAG | FL_KEEP_SIZE_FLAG)) {
+		fuse_reply_err(req, EOPNOTSUPP);
+		return;
+	}
 
 	pthread_mutex_lock(&ff->bfl);
 	if (!fs_writeable(fs)) {
@@ -3859,7 +3891,7 @@ static int op_fallocate(const char *path EXT2FS_ATTR((unused)), int mode,
 out:
 	pthread_mutex_unlock(&ff->bfl);
 
-	return ret;
+	fuse_reply_err(req, -ret);
 }
 # endif /* SUPPORT_FALLOCATE */
 
@@ -3876,6 +3908,14 @@ static struct fuse_lowlevel_ops ll_ops = {
 	.getxattr = op_getxattr,
 	.listxattr = op_listxattr,
 	.removexattr = op_removexattr,
+	.release = op_release,
+	.releasedir = op_release,
+	.fsync = op_fsync,
+	.fsyncdir = op_fsync,
+	.ioctl = op_ioctl,
+#ifdef SUPPORT_FALLOCATE
+	.fallocate = op_fallocate,
+#endif
 };
 
 static struct fuse_operations fs_ops = {
@@ -3889,20 +3929,12 @@ static struct fuse_operations fs_ops = {
 	.read = op_read,
 	.write = op_write,
 	.statfs = op_statfs,
-	.release = op_release,
-	.fsync = op_fsync,
 	.opendir = op_open,
 	.readdir = op_readdir,
-	.releasedir = op_release,
-	.fsyncdir = op_fsync,
 	.access = op_access,
 	.create = op_create,
 	.utimens = op_utimens,
 	.bmap = op_bmap,
-	.ioctl = op_ioctl,
-#ifdef SUPPORT_FALLOCATE
-	.fallocate = op_fallocate,
-#endif
 };
 
 static int get_random_bytes(void *p, size_t sz)
