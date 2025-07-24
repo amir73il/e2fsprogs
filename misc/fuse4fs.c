@@ -946,8 +946,8 @@ out:
 		fuse_reply_readlink(req, buf);
 }
 
-static int __getxattr(struct fuse2fs *ff, ext2_ino_t ino, const char *name,
-		      void **value, size_t *value_len)
+static int do_getxattr(struct fuse2fs *ff, ext2_ino_t ino, const char *name,
+		       void **value, size_t *value_len)
 {
 	ext2_filsys fs = ff->fs;
 	struct ext2_xattr_handle *h;
@@ -977,8 +977,8 @@ out_close:
 	return ret;
 }
 
-static int __setxattr(struct fuse2fs *ff, ext2_ino_t ino, const char *name,
-		      void *value, size_t valuelen)
+static int do_setxattr(struct fuse2fs *ff, ext2_ino_t ino, const char *name,
+		       void *value, size_t valuelen)
 {
 	ext2_filsys fs = ff->fs;
 	struct ext2_xattr_handle *h;
@@ -1018,8 +1018,8 @@ static int propagate_default_acls(struct fuse2fs *ff, ext2_ino_t parent,
 	if (!ff->acl)
 		return 0;
 
-	ret = __getxattr(ff, parent, XATTR_NAME_POSIX_ACL_DEFAULT, &def,
-			 &deflen);
+	ret = do_getxattr(ff, parent, XATTR_NAME_POSIX_ACL_DEFAULT, &def,
+			  &deflen);
 	switch (ret) {
 	case -ENODATA:
 	case -ENOENT:
@@ -1031,7 +1031,7 @@ static int propagate_default_acls(struct fuse2fs *ff, ext2_ino_t parent,
 		return ret;
 	}
 
-	ret = __setxattr(ff, child, XATTR_NAME_POSIX_ACL_DEFAULT, def, deflen);
+	ret = do_setxattr(ff, child, XATTR_NAME_POSIX_ACL_DEFAULT, def, deflen);
 	ext2fs_free_mem(&def);
 	return ret;
 }
@@ -2581,22 +2581,24 @@ static int validate_xattr_name(const char *name)
 	return 0;
 }
 
-static int op_getxattr(const char *path, const char *key, char *value,
-		       size_t len)
+static void op_getxattr(fuse_req_t req, fuse_ino_t fino, const char *key,
+			size_t len)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	void *ptr;
+	void *ptr = NULL;
 	size_t plen;
-	ext2_ino_t ino;
+	ext2_ino_t ino = (ext2_ino_t) fino;
 	errcode_t err;
 	int ret = 0;
 
-	if (!validate_xattr_name(key))
-		return -ENODATA;
+	if (!validate_xattr_name(key)) {
+		fuse_reply_err(req, ENODATA);
+		return;
+	}
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
 	pthread_mutex_lock(&ff->bfl);
 	if (!ext2fs_has_feature_xattr(fs->super)) {
@@ -2604,18 +2606,13 @@ static int op_getxattr(const char *path, const char *key, char *value,
 		goto out;
 	}
 
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
-	if (err || ino == 0) {
-		ret = translate_error(fs, 0, err);
-		goto out;
-	}
 	dbg_printf(ff, "%s: ino=%d name=%s\n", __func__, ino, key);
 
 	ret = check_inum_access(ff, ino, R_OK);
 	if (ret)
 		goto out;
 
-	ret = __getxattr(ff, ino, key, &ptr, &plen);
+	ret = do_getxattr(ff, ino, key, &ptr, &plen);
 	if (ret)
 		goto out;
 
@@ -2624,15 +2621,19 @@ static int op_getxattr(const char *path, const char *key, char *value,
 	} else if (len < plen) {
 		ret = -ERANGE;
 	} else {
-		memcpy(value, ptr, plen);
 		ret = plen;
 	}
 
-	ext2fs_free_mem(&ptr);
 out:
 	pthread_mutex_unlock(&ff->bfl);
-
-	return ret;
+	if (ret < 0)
+		fuse_reply_err(req, -ret);
+	else if (!len)
+		fuse_reply_xattr(req, ret);
+	else
+		fuse_reply_buf(req, ptr, ret);
+	if (ptr)
+		ext2fs_free_mem(&ptr);
 }
 
 static int count_buffer_space(char *name, char *value EXT2FS_ATTR((unused)),
@@ -2657,18 +2658,19 @@ static int copy_names(char *name, char *value EXT2FS_ATTR((unused)),
 	return 0;
 }
 
-static int op_listxattr(const char *path, char *names, size_t len)
+static void op_listxattr(fuse_req_t req, fuse_ino_t fino, size_t len)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
 	struct ext2_xattr_handle *h;
+	char *names = NULL;
 	unsigned int bufsz;
-	ext2_ino_t ino;
+	ext2_ino_t ino = (ext2_ino_t) fino;
 	errcode_t err;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
 	pthread_mutex_lock(&ff->bfl);
 	if (!ext2fs_has_feature_xattr(fs->super)) {
@@ -2676,11 +2678,6 @@ static int op_listxattr(const char *path, char *names, size_t len)
 		goto out;
 	}
 
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
-	if (err || ino == 0) {
-		ret = translate_error(fs, ino, err);
-		goto out;
-	}
 	dbg_printf(ff, "%s: ino=%d\n", __func__, ino);
 
 	ret = check_inum_access(ff, ino, R_OK);
@@ -2708,7 +2705,6 @@ static int op_listxattr(const char *path, char *names, size_t len)
 	}
 
 	if (len == 0) {
-		ret = bufsz;
 		goto out2;
 	} else if (len < bufsz) {
 		ret = -ERANGE;
@@ -2716,42 +2712,56 @@ static int op_listxattr(const char *path, char *names, size_t len)
 	}
 
 	/* Copy names out */
-	memset(names, 0, len);
-	err = ext2fs_xattrs_iterate(h, copy_names, &names);
+	err = ext2fs_get_mem(len, &names);
 	if (err) {
 		ret = translate_error(fs, ino, err);
 		goto out2;
 	}
-	ret = bufsz;
+	memset(names, 0, len);
+	char *names_ptr = names;
+	err = ext2fs_xattrs_iterate(h, copy_names, &names_ptr);
+	if (err) {
+		ret = translate_error(fs, ino, err);
+		goto out2;
+	}
 out2:
 	err = ext2fs_xattrs_close(&h);
 	if (err && !ret)
 		ret = translate_error(fs, ino, err);
 out:
 	pthread_mutex_unlock(&ff->bfl);
-
-	return ret;
+	if (ret)
+		fuse_reply_err(req, -ret);
+	else if (names)
+		fuse_reply_buf(req, names, bufsz);
+	else
+		fuse_reply_xattr(req, bufsz);
+	if (names)
+		ext2fs_free_mem(&names);
 }
 
-static int op_setxattr(const char *path EXT2FS_ATTR((unused)),
-		       const char *key, const char *value,
-		       size_t len, int flags)
+static void op_setxattr(fuse_req_t req, fuse_ino_t fino, const char *key,
+			const char *value, size_t len, int flags)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
 	struct ext2_xattr_handle *h;
-	ext2_ino_t ino;
+	ext2_ino_t ino = (ext2_ino_t) fino;
 	errcode_t err;
 	int ret = 0;
 
-	if (flags & ~(XATTR_CREATE | XATTR_REPLACE))
-		return -EOPNOTSUPP;
+	if (flags & ~(XATTR_CREATE | XATTR_REPLACE)) {
+		fuse_reply_err(req, EOPNOTSUPP);
+		return;
+	}
 
-	if (!validate_xattr_name(key))
-		return -EINVAL;
+	if (!validate_xattr_name(key)) {
+		fuse_reply_err(req, EINVAL);
+		return;
+	}
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
 	pthread_mutex_lock(&ff->bfl);
 	if (!ext2fs_has_feature_xattr(fs->super)) {
@@ -2759,11 +2769,6 @@ static int op_setxattr(const char *path EXT2FS_ATTR((unused)),
 		goto out;
 	}
 
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
-	if (err || ino == 0) {
-		ret = translate_error(fs, 0, err);
-		goto out;
-	}
 	dbg_printf(ff, "%s: ino=%d name=%s\n", __func__, ino, key);
 
 	ret = check_inum_access(ff, ino, W_OK);
@@ -2823,11 +2828,10 @@ out2:
 		ret = translate_error(fs, ino, err);
 out:
 	pthread_mutex_unlock(&ff->bfl);
-
-	return ret;
+	fuse_reply_err(req, -ret);
 }
 
-static int op_removexattr(const char *path, const char *key)
+static void op_removexattr(fuse_req_t req, fuse_ino_t fino, const char *key)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
@@ -2835,7 +2839,7 @@ static int op_removexattr(const char *path, const char *key)
 	struct ext2_xattr_handle *h;
 	void *buf;
 	size_t buflen;
-	ext2_ino_t ino;
+	ext2_ino_t ino = (ext2_ino_t) fino;
 	errcode_t err;
 	int ret = 0;
 
@@ -2843,13 +2847,17 @@ static int op_removexattr(const char *path, const char *key)
 	 * Once in a while libfuse gives us a no-name xattr to delete as part
 	 * of clearing ACLs.  Just pretend we cleared them.
 	 */
-	if (key[0] == 0)
-		return 0;
+	if (key[0] == 0) {
+		fuse_reply_err(req, 0);
+		return;
+	}
 
-	if (!validate_xattr_name(key))
-		return -ENODATA;
+	if (!validate_xattr_name(key)) {
+		fuse_reply_err(req, ENODATA);
+		return;
+	}
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
 	pthread_mutex_lock(&ff->bfl);
 	if (!ext2fs_has_feature_xattr(fs->super)) {
@@ -2862,11 +2870,6 @@ static int op_removexattr(const char *path, const char *key)
 		goto out;
 	}
 
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
-	if (err || ino == 0) {
-		ret = translate_error(fs, 0, err);
-		goto out;
-	}
 	dbg_printf(ff, "%s: ino=%d name=%s\n", __func__, ino, key);
 
 	ret = check_inum_access(ff, ino, W_OK);
@@ -2919,8 +2922,7 @@ out2:
 		ret = translate_error(fs, ino, err);
 out:
 	pthread_mutex_unlock(&ff->bfl);
-
-	return ret;
+	fuse_reply_err(req, -ret);
 }
 
 struct readdir_iter {
@@ -3870,6 +3872,10 @@ static struct fuse_lowlevel_ops ll_ops = {
 	.unlink = op_unlink,
 	.rmdir = op_rmdir,
 	.rename = op_rename,
+	.setxattr = op_setxattr,
+	.getxattr = op_getxattr,
+	.listxattr = op_listxattr,
+	.removexattr = op_removexattr,
 };
 
 static struct fuse_operations fs_ops = {
@@ -3885,10 +3891,6 @@ static struct fuse_operations fs_ops = {
 	.statfs = op_statfs,
 	.release = op_release,
 	.fsync = op_fsync,
-	.setxattr = op_setxattr,
-	.getxattr = op_getxattr,
-	.listxattr = op_listxattr,
-	.removexattr = op_removexattr,
 	.opendir = op_open,
 	.readdir = op_readdir,
 	.releasedir = op_release,
