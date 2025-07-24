@@ -876,27 +876,24 @@ out:
 	return ret;
 }
 
-static int op_readlink(const char *path, char *buf, size_t len)
+static void op_readlink(fuse_req_t req, fuse_ino_t fino)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
 	errcode_t err;
-	ext2_ino_t ino;
+	ext2_ino_t ino = (ext2_ino_t)fino;
 	struct ext2_inode inode;
 	unsigned int got;
 	ext2_file_t file;
+	char buf[PATH_MAX + 1];
+	size_t len;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	dbg_printf(ff, "%s: path=%s\n", __func__, path);
+	dbg_printf(ff, "%s: ino=%d\n", __func__, ino);
 	pthread_mutex_lock(&ff->bfl);
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
-	if (err || ino == 0) {
-		ret = translate_error(fs, 0, err);
-		goto out;
-	}
 
 	err = ext2fs_read_inode(fs, ino, &inode);
 	if (err) {
@@ -909,12 +906,10 @@ static int op_readlink(const char *path, char *buf, size_t len)
 		goto out;
 	}
 
-	len--;
-	if (inode.i_size < len)
-		len = inode.i_size;
-	if (ext2fs_is_fast_symlink(&inode))
+	len = inode.i_size;
+	if (ext2fs_is_fast_symlink(&inode)) {
 		memcpy(buf, (char *)inode.i_block, len);
-	else {
+	} else {
 		/* big/inline symlink */
 
 		err = ext2fs_file_open(fs, ino, 0, &file);
@@ -925,12 +920,8 @@ static int op_readlink(const char *path, char *buf, size_t len)
 
 		err = ext2fs_file_read(file, buf, len, &got);
 		if (err || got != len) {
-			ext2fs_file_close(file);
 			ret = translate_error(fs, ino, err);
-			goto out2;
 		}
-
-out2:
 		err = ext2fs_file_close(file);
 		if (ret)
 			goto out;
@@ -949,7 +940,10 @@ out2:
 
 out:
 	pthread_mutex_unlock(&ff->bfl);
-	return ret;
+	if (ret)
+		fuse_reply_err(req, -ret);
+	else
+		fuse_reply_readlink(req, buf);
 }
 
 static int __getxattr(struct fuse2fs *ff, ext2_ino_t ino, const char *name,
@@ -1042,36 +1036,49 @@ static int propagate_default_acls(struct fuse2fs *ff, ext2_ino_t parent,
 	return ret;
 }
 
-static int op_mknod(const char *path, mode_t mode, dev_t dev)
+/* Helper function to handle successful entry creation replies */
+static void reply_entry_or_error(fuse_req_t req, ext2_filsys fs, ext2_ino_t ino,
+				  struct ext2_inode_large *inode, int ret)
+{
+	struct fuse_entry_param e;
+	struct stat statbuf;
+
+	if (ret) {
+		fuse_reply_err(req, -ret);
+		return;
+	}
+
+	/* Get stat info for the new entry */
+	ret = stat_inode(fs, ino, &statbuf);
+	if (ret) {
+		fuse_reply_err(req, -ret);
+		return;
+	}
+
+	e.ino = ino;
+	e.generation = inode->i_generation;
+	e.attr_timeout = 0.0;
+	e.entry_timeout = 0.0;
+	e.attr = statbuf;
+	fuse_reply_entry(req, &e);
+}
+
+static void op_mknod(fuse_req_t req, fuse_ino_t pino, const char *name,
+		     mode_t mode, dev_t dev)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t parent, child;
-	char *temp_path;
+	ext2_ino_t child, parent = (ext2_ino_t)pino;
 	errcode_t err;
-	char *node_name, a;
 	int filetype;
 	struct ext2_inode_large inode;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	dbg_printf(ff, "%s: path=%s mode=0%o dev=0x%x\n", __func__, path, mode,
+	dbg_printf(ff, "%s: name=%s mode=0%o dev=0x%x\n", __func__, name, mode,
 		   (unsigned int)dev);
-	temp_path = strdup(path);
-	if (!temp_path) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	node_name = strrchr(temp_path, '/');
-	if (!node_name) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	node_name++;
-	a = *node_name;
-	*node_name = 0;
 
 	pthread_mutex_lock(&ff->bfl);
 	if (!fs_can_allocate(ff, 2)) {
@@ -1079,18 +1086,9 @@ static int op_mknod(const char *path, mode_t mode, dev_t dev)
 		goto out2;
 	}
 
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, temp_path,
-			   &parent);
-	if (err) {
-		ret = translate_error(fs, 0, err);
-		goto out2;
-	}
-
 	ret = check_inum_access(ff, parent, A_OK | W_OK);
 	if (ret)
 		goto out2;
-
-	*node_name = a;
 
 	if (LINUX_S_ISCHR(mode))
 		filetype = EXT2_FT_CHRDEV;
@@ -1112,8 +1110,8 @@ static int op_mknod(const char *path, mode_t mode, dev_t dev)
 	}
 
 	dbg_printf(ff, "%s: create ino=%d/name=%s in dir=%d\n", __func__, child,
-		   node_name, parent);
-	err = ext2fs_link(fs, parent, node_name, child,
+		   name, parent);
+	err = ext2fs_link(fs, parent, name, child,
 			  filetype | EXT2FS_LINK_EXPAND);
 	if (err) {
 		ret = translate_error(fs, parent, err);
@@ -1158,55 +1156,34 @@ static int op_mknod(const char *path, mode_t mode, dev_t dev)
 	ret = propagate_default_acls(ff, parent, child);
 	if (ret)
 		goto out2;
+
 out2:
 	pthread_mutex_unlock(&ff->bfl);
-out:
-	free(temp_path);
-	return ret;
+
+	reply_entry_or_error(req, fs, child, &inode, ret);
 }
 
-static int op_mkdir(const char *path, mode_t mode)
+static void op_mkdir(fuse_req_t req, fuse_ino_t pino, const char *name,
+		     mode_t mode)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t parent, child;
-	char *temp_path;
+	ext2_ino_t child, parent = (ext2_ino_t)pino;
 	errcode_t err;
-	char *node_name, a;
 	struct ext2_inode_large inode;
 	char *block;
 	blk64_t blk;
 	int ret = 0;
 	mode_t parent_sgid;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	dbg_printf(ff, "%s: path=%s mode=0%o\n", __func__, path, mode);
-	temp_path = strdup(path);
-	if (!temp_path) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	node_name = strrchr(temp_path, '/');
-	if (!node_name) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	node_name++;
-	a = *node_name;
-	*node_name = 0;
+	dbg_printf(ff, "%s: name=%s mode=0%o\n", __func__, name, mode);
 
 	pthread_mutex_lock(&ff->bfl);
 	if (!fs_can_allocate(ff, 1)) {
 		ret = -ENOSPC;
-		goto out2;
-	}
-
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, temp_path,
-			   &parent);
-	if (err) {
-		ret = translate_error(fs, 0, err);
 		goto out2;
 	}
 
@@ -1222,10 +1199,8 @@ static int op_mkdir(const char *path, mode_t mode)
 	}
 	parent_sgid = inode.i_mode & S_ISGID;
 
-	*node_name = a;
-
 	err = ext2fs_mkdir2(fs, parent, 0, 0, EXT2FS_LINK_EXPAND,
-			    node_name, NULL);
+			    name, NULL);
 	if (err) {
 		ret = translate_error(fs, parent, err);
 		goto out2;
@@ -1236,14 +1211,14 @@ static int op_mkdir(const char *path, mode_t mode)
 		goto out2;
 
 	/* Still have to update the uid/gid of the dir */
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, temp_path,
+	err = ext2fs_namei(fs, EXT2_ROOT_INO, parent, name,
 			   &child);
 	if (err) {
 		ret = translate_error(fs, 0, err);
 		goto out2;
 	}
 	dbg_printf(ff, "%s: created ino=%d/path=%s in dir=%d\n", __func__, child,
-		   node_name, parent);
+		   name, parent);
 
 	err = fuse2fs_read_inode(fs, child, &inode);
 	if (err) {
@@ -1295,9 +1270,8 @@ out3:
 	ext2fs_free_mem(&block);
 out2:
 	pthread_mutex_unlock(&ff->bfl);
-out:
-	free(temp_path);
-	return ret;
+
+	reply_entry_or_error(req, fs, child, &inode, ret);
 }
 
 static errcode_t remove_ea_inodes(struct fuse2fs *ff, ext2_ino_t ino,
@@ -1583,43 +1557,22 @@ static void op_rmdir(fuse_req_t req, fuse_ino_t pino, const char *name)
 	fuse_reply_err(req, -ret);
 }
 
-static int op_symlink(const char *src, const char *dest)
+static void op_symlink(fuse_req_t req, const char *src, fuse_ino_t pino,
+		       const char *name)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	ext2_ino_t parent, child;
-	char *temp_path;
+	ext2_ino_t child, parent = (ext2_ino_t)pino;
 	errcode_t err;
-	char *node_name, a;
 	struct ext2_inode_large inode;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	dbg_printf(ff, "%s: symlink %s to %s\n", __func__, src, dest);
-	temp_path = strdup(dest);
-	if (!temp_path) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	node_name = strrchr(temp_path, '/');
-	if (!node_name) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	node_name++;
-	a = *node_name;
-	*node_name = 0;
+	dbg_printf(ff, "%s: symlink %s to %s\n", __func__, src, name);
 
 	pthread_mutex_lock(&ff->bfl);
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, temp_path,
-			   &parent);
-	*node_name = a;
-	if (err) {
-		ret = translate_error(fs, 0, err);
-		goto out2;
-	}
 
 	ret = check_inum_access(ff, parent, A_OK | W_OK);
 	if (ret)
@@ -1627,7 +1580,7 @@ static int op_symlink(const char *src, const char *dest)
 
 
 	/* Create symlink */
-	err = ext2fs_symlink(fs, parent, 0, node_name, src);
+	err = ext2fs_symlink(fs, parent, 0, name, src);
 	if (err == EXT2_ET_DIR_NO_SPACE) {
 		err = ext2fs_expand_dir(fs, parent);
 		if (err) {
@@ -1635,7 +1588,7 @@ static int op_symlink(const char *src, const char *dest)
 			goto out2;
 		}
 
-		err = ext2fs_symlink(fs, parent, 0, node_name, src);
+		err = ext2fs_symlink(fs, parent, 0, name, src);
 	}
 	if (err) {
 		ret = translate_error(fs, parent, err);
@@ -1648,14 +1601,13 @@ static int op_symlink(const char *src, const char *dest)
 		goto out2;
 
 	/* Still have to update the uid/gid of the symlink */
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, temp_path,
-			   &child);
+	err = ext2fs_namei(fs, EXT2_ROOT_INO, parent, name, &child);
 	if (err) {
 		ret = translate_error(fs, 0, err);
 		goto out2;
 	}
 	dbg_printf(ff, "%s: symlinking ino=%d/name=%s to dir=%d\n", __func__,
-		   child, node_name, parent);
+		   child, name, parent);
 
 	err = fuse2fs_read_inode(fs, child, &inode);
 	if (err) {
@@ -1677,9 +1629,8 @@ static int op_symlink(const char *src, const char *dest)
 	}
 out2:
 	pthread_mutex_unlock(&ff->bfl);
-out:
-	free(temp_path);
-	return ret;
+
+	reply_entry_or_error(req, fs, child, &inode, ret);
 }
 
 struct update_dotdot {
@@ -1887,34 +1838,22 @@ out:
 	fuse_reply_err(req, -ret);
 }
 
-static int op_link(const char *src, const char *dest)
+static void op_link(fuse_req_t req, fuse_ino_t src_ino, fuse_ino_t pino,
+		    const char *name)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
-	char *temp_path;
 	errcode_t err;
-	char *node_name, a;
-	ext2_ino_t parent, ino;
+	ext2_ino_t parent = (ext2_ino_t)pino;
+	ext2_ino_t ino = (ext2_ino_t)src_ino;
 	struct ext2_inode_large inode;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	dbg_printf(ff, "%s: src=%s dest=%s\n", __func__, src, dest);
-	temp_path = strdup(dest);
-	if (!temp_path) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	node_name = strrchr(temp_path, '/');
-	if (!node_name) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	node_name++;
-	a = *node_name;
-	*node_name = 0;
+	dbg_printf(ff, "%s: linking ino=%d to dest=%d/%s\n", __func__,
+		   ino, parent, name);
 
 	pthread_mutex_lock(&ff->bfl);
 	if (!fs_can_allocate(ff, 2)) {
@@ -1922,23 +1861,9 @@ static int op_link(const char *src, const char *dest)
 		goto out2;
 	}
 
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, temp_path,
-			   &parent);
-	*node_name = a;
-	if (err) {
-		err = -ENOENT;
-		goto out2;
-	}
-
 	ret = check_inum_access(ff, parent, A_OK | W_OK);
 	if (ret)
 		goto out2;
-
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, src, &ino);
-	if (err || ino == 0) {
-		ret = translate_error(fs, 0, err);
-		goto out2;
-	}
 
 	err = fuse2fs_read_inode(fs, ino, &inode);
 	if (err) {
@@ -1962,8 +1887,8 @@ static int op_link(const char *src, const char *dest)
 	}
 
 	dbg_printf(ff, "%s: linking ino=%d/name=%s to dir=%d\n", __func__, ino,
-		   node_name, parent);
-	err = ext2fs_link(fs, parent, node_name, ino,
+		   name, parent);
+	err = ext2fs_link(fs, parent, name, ino,
 			  ext2_file_type(inode.i_mode) | EXT2FS_LINK_EXPAND);
 	if (err) {
 		ret = translate_error(fs, parent, err);
@@ -1976,9 +1901,8 @@ static int op_link(const char *src, const char *dest)
 
 out2:
 	pthread_mutex_unlock(&ff->bfl);
-out:
-	free(temp_path);
-	return ret;
+
+	reply_entry_or_error(req, fs, ino, &inode, ret);
 }
 
 /* Obtain group ids of the process that sent us a command(?) */
@@ -3938,6 +3862,11 @@ out:
 # endif /* SUPPORT_FALLOCATE */
 
 static struct fuse_lowlevel_ops ll_ops = {
+	.mkdir = op_mkdir,
+	.mknod = op_mknod,
+	.link = op_link,
+	.symlink = op_symlink,
+	.readlink = op_readlink,
 	.unlink = op_unlink,
 	.rmdir = op_rmdir,
 	.rename = op_rename,
@@ -3947,11 +3876,6 @@ static struct fuse_operations fs_ops = {
 	.init = op_init,
 	.destroy = op_destroy,
 	.getattr = op_getattr,
-	.readlink = op_readlink,
-	.mknod = op_mknod,
-	.mkdir = op_mkdir,
-	.symlink = op_symlink,
-	.link = op_link,
 	.chmod = op_chmod,
 	.chown = op_chown,
 	.truncate = op_truncate,
