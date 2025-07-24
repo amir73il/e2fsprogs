@@ -599,7 +599,7 @@ static int fs_writeable(ext2_filsys fs)
 	return (fs->flags & EXT2_FLAG_RW) && (fs->super->s_error_count == 0);
 }
 
-static inline int is_superuser(struct fuse2fs *ff, struct fuse_context *ctxt)
+static inline int is_superuser(struct fuse2fs *ff, const struct fuse_ctx *ctxt)
 {
 	if (ff->fakeroot)
 		return 1;
@@ -607,7 +607,7 @@ static inline int is_superuser(struct fuse2fs *ff, struct fuse_context *ctxt)
 }
 
 static inline int want_check_owner(struct fuse2fs *ff,
-				   struct fuse_context *ctxt)
+				   const struct fuse_ctx *ctxt)
 {
 	/*
 	 * The kernel is responsible for access control, so we allow anything
@@ -652,9 +652,9 @@ static int check_iflags_access(struct fuse2fs *ff, ext2_ino_t ino,
 	return 0;
 }
 
-static int check_inum_access(struct fuse2fs *ff, ext2_ino_t ino, int mask)
+static int check_inum_access(struct fuse2fs *ff, const struct fuse_ctx *ctxt,
+			     ext2_ino_t ino, int mask)
 {
-	struct fuse_context *ctxt = fuse_get_context();
 	ext2_filsys fs = ff->fs;
 	struct ext2_inode inode;
 	mode_t perms;
@@ -872,7 +872,7 @@ static int stat_inode(ext2_filsys fs, ext2_ino_t ino, struct stat *statbuf)
 
 static void op_lookup(fuse_req_t req, fuse_ino_t pino, const char *name)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	ext2_ino_t parent = fuse_to_ext2_ino(pino);
@@ -913,7 +913,7 @@ out:
 static void op_getattr(fuse_req_t req, fuse_ino_t fino,
 		       struct fuse_file_info *fi EXT2FS_ATTR((unused)))
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	ext2_ino_t ino = fuse_to_ext2_ino(fino);
@@ -937,7 +937,7 @@ static void op_getattr(fuse_req_t req, fuse_ino_t fino,
 
 static void op_readlink(fuse_req_t req, fuse_ino_t fino)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	errcode_t err;
@@ -1125,7 +1125,7 @@ static void reply_entry_or_error(fuse_req_t req, ext2_filsys fs, ext2_ino_t ino,
 static void op_mknod(fuse_req_t req, fuse_ino_t pino, const char *name,
 		     mode_t mode, dev_t dev)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	ext2_ino_t child, parent = fuse_to_ext2_ino(pino);
@@ -1145,7 +1145,7 @@ static void op_mknod(fuse_req_t req, fuse_ino_t pino, const char *name,
 		goto out2;
 	}
 
-	ret = check_inum_access(ff, parent, A_OK | W_OK);
+	ret = check_inum_access(ff, ctxt, parent, A_OK | W_OK);
 	if (ret)
 		goto out2;
 
@@ -1225,7 +1225,7 @@ out2:
 static void op_mkdir(fuse_req_t req, fuse_ino_t pino, const char *name,
 		     mode_t mode)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	ext2_ino_t child, parent = fuse_to_ext2_ino(pino);
@@ -1246,7 +1246,7 @@ static void op_mkdir(fuse_req_t req, fuse_ino_t pino, const char *name,
 		goto out2;
 	}
 
-	ret = check_inum_access(ff, parent, A_OK | W_OK);
+	ret = check_inum_access(ff, ctxt, parent, A_OK | W_OK);
 	if (ret)
 		goto out2;
 
@@ -1433,7 +1433,8 @@ out:
 	return ret;
 }
 
-static int __op_unlink(struct fuse2fs *ff, ext2_ino_t parent, const char *name)
+static int do_unlink(struct fuse2fs *ff, const struct fuse_ctx *ctxt,
+		     ext2_ino_t parent, const char *name)
 {
 	ext2_filsys fs = ff->fs;
 	ext2_ino_t ino;
@@ -1447,11 +1448,11 @@ static int __op_unlink(struct fuse2fs *ff, ext2_ino_t parent, const char *name)
 		goto out;
 	}
 
-	ret = check_inum_access(ff, ino, W_OK);
+	ret = check_inum_access(ff, ctxt, ino, W_OK);
 	if (ret)
 		goto out;
 
-	ret = check_inum_access(ff, parent, W_OK);
+	ret = check_inum_access(ff, ctxt, parent, W_OK);
 	if (ret)
 		goto out;
 
@@ -1474,14 +1475,14 @@ out:
 
 static void op_unlink(fuse_req_t req, fuse_ino_t pino, const char *name)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_ino_t parent = fuse_to_ext2_ino(pino);
 	int ret;
 
 	FUSE4FS_CHECK_CONTEXT(ff, req);
 	pthread_mutex_lock(&ff->bfl);
-	ret = __op_unlink(ff, parent, name);
+	ret = do_unlink(ff, ctxt, parent, name);
 	pthread_mutex_unlock(&ff->bfl);
 	fuse_reply_err(req, -ret);
 }
@@ -1514,7 +1515,8 @@ static int rmdir_proc(ext2_ino_t dir EXT2FS_ATTR((unused)),
 	return 0;
 }
 
-static int __op_rmdir(struct fuse2fs *ff, ext2_ino_t parent, const char *name)
+static int do_rmdir(struct fuse2fs *ff, const struct fuse_ctx *ctxt,
+		    ext2_ino_t parent, const char *name)
 {
 	ext2_filsys fs = ff->fs;
 	ext2_ino_t child;
@@ -1530,7 +1532,7 @@ static int __op_rmdir(struct fuse2fs *ff, ext2_ino_t parent, const char *name)
 	}
 	dbg_printf(ff, "%s: rmdir name=%s ino=%d\n", __func__, name, child);
 
-	ret = check_inum_access(ff, child, W_OK);
+	ret = check_inum_access(ff, ctxt, child, W_OK);
 	if (ret)
 		goto out;
 
@@ -1549,7 +1551,7 @@ static int __op_rmdir(struct fuse2fs *ff, ext2_ino_t parent, const char *name)
 		goto out;
 	}
 
-	ret = check_inum_access(ff, parent, W_OK);
+	ret = check_inum_access(ff, ctxt, parent, W_OK);
 	if (ret)
 		goto out;
 
@@ -1604,14 +1606,14 @@ out:
 
 static void op_rmdir(fuse_req_t req, fuse_ino_t pino, const char *name)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_ino_t parent = fuse_to_ext2_ino(pino);
 	int ret;
 
 	FUSE4FS_CHECK_CONTEXT(ff, req);
 	pthread_mutex_lock(&ff->bfl);
-	ret = __op_rmdir(ff, parent, name);
+	ret = do_rmdir(ff, ctxt, parent, name);
 	pthread_mutex_unlock(&ff->bfl);
 	fuse_reply_err(req, -ret);
 }
@@ -1619,7 +1621,7 @@ static void op_rmdir(fuse_req_t req, fuse_ino_t pino, const char *name)
 static void op_symlink(fuse_req_t req, const char *src, fuse_ino_t pino,
 		       const char *name)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	ext2_ino_t child, parent = fuse_to_ext2_ino(pino);
@@ -1633,7 +1635,7 @@ static void op_symlink(fuse_req_t req, const char *src, fuse_ino_t pino,
 
 	pthread_mutex_lock(&ff->bfl);
 
-	ret = check_inum_access(ff, parent, A_OK | W_OK);
+	ret = check_inum_access(ff, ctxt, parent, A_OK | W_OK);
 	if (ret)
 		goto out2;
 
@@ -1718,7 +1720,7 @@ static int update_dotdot_helper(ext2_ino_t dir EXT2FS_ATTR((unused)),
 static void op_rename(fuse_req_t req, fuse_ino_t from_parent, const char *from,
 		      fuse_ino_t to_parent, const char *to, unsigned int flags)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	errcode_t err;
@@ -1764,21 +1766,21 @@ static void op_rename(fuse_req_t req, fuse_ino_t from_parent, const char *from,
 		goto out;
 	}
 
-	ret = check_inum_access(ff, from_ino, W_OK);
+	ret = check_inum_access(ff, ctxt, from_ino, W_OK);
 	if (ret)
 		goto out;
 
 	if (to_ino) {
-		ret = check_inum_access(ff, to_ino, W_OK);
+		ret = check_inum_access(ff, ctxt, to_ino, W_OK);
 		if (ret)
 			goto out;
 	}
 
-	ret = check_inum_access(ff, from_dir_ino, W_OK);
+	ret = check_inum_access(ff, ctxt, from_dir_ino, W_OK);
 	if (ret)
 		goto out;
 
-	ret = check_inum_access(ff, to_dir_ino, W_OK);
+	ret = check_inum_access(ff, ctxt, to_dir_ino, W_OK);
 	if (ret)
 		goto out;
 
@@ -1794,9 +1796,9 @@ static void op_rename(fuse_req_t req, fuse_ino_t from_parent, const char *from,
 			   LINUX_S_ISDIR(inode.i_mode) ? "dir" : "file",
 			   to_ino);
 		if (LINUX_S_ISDIR(inode.i_mode))
-			ret = __op_rmdir(ff, to_dir_ino, to);
+			ret = do_rmdir(ff, ctxt, to_dir_ino, to);
 		else
-			ret = __op_unlink(ff, to_dir_ino, to);
+			ret = do_unlink(ff, ctxt, to_dir_ino, to);
 		if (ret)
 			goto out;
 	}
@@ -1900,7 +1902,7 @@ out:
 static void op_link(fuse_req_t req, fuse_ino_t src_ino, fuse_ino_t pino,
 		    const char *name)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	errcode_t err;
@@ -1920,7 +1922,7 @@ static void op_link(fuse_req_t req, fuse_ino_t src_ino, fuse_ino_t pino,
 		goto out2;
 	}
 
-	ret = check_inum_access(ff, parent, A_OK | W_OK);
+	ret = check_inum_access(ff, ctxt, parent, A_OK | W_OK);
 	if (ret)
 		goto out2;
 
@@ -2001,9 +2003,8 @@ static int get_req_groups(struct fuse2fs *ff, gid_t **gids, size_t *nr_gids)
  * that initiated the fuse request?  Returns 1 for yes, 0 for no, or a negative
  * errno.
  */
-static int in_file_group(fuse_req_t req, const struct ext2_inode_large *inode)
+static int in_file_group(struct fuse2fs *ff, const struct ext2_inode_large *inode)
 {
-	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	gid_t *gids = NULL;
 	size_t i, nr_gids = 0;
 	gid_t gid = inode_gid(*inode);
@@ -2019,10 +2020,9 @@ static int in_file_group(fuse_req_t req, const struct ext2_inode_large *inode)
 	return 0;
 }
 
-static int do_chmod(fuse_req_t req, struct fuse2fs *ff, ext2_ino_t ino, mode_t mode,
-		   struct ext2_inode_large *inode)
+static int do_chmod(struct fuse2fs *ff, const struct fuse_ctx *ctxt,
+		    ext2_ino_t ino, mode_t mode, struct ext2_inode_large *inode)
 {
-	struct fuse_context *ctxt = fuse_get_context();
 	int ret;
 
 	ret = check_iflags_access(ff, ino, EXT2_INODE(inode), W_OK);
@@ -2039,7 +2039,7 @@ static int do_chmod(fuse_req_t req, struct fuse2fs *ff, ext2_ino_t ino, mode_t m
 	 * group.
 	 */
 	if (!is_superuser(ff, ctxt)) {
-		ret = in_file_group(req, inode);
+		ret = in_file_group(ff, inode);
 		if (ret < 0)
 			return ret;
 		if (!ret)
@@ -2054,10 +2054,10 @@ static int do_chmod(fuse_req_t req, struct fuse2fs *ff, ext2_ino_t ino, mode_t m
 	return 0;
 }
 
-static int do_chown(struct fuse2fs *ff, ext2_ino_t ino, uid_t owner, gid_t group,
+static int do_chown(struct fuse2fs *ff, const struct fuse_ctx *ctxt,
+		    ext2_ino_t ino, uid_t owner, gid_t group,
 		    struct ext2_inode_large *inode)
 {
-	struct fuse_context *ctxt = fuse_get_context();
 	int ret;
 
 	ret = check_iflags_access(ff, ino, EXT2_INODE(inode), W_OK);
@@ -2160,13 +2160,14 @@ out_close:
 
 
 
-static int do_truncate(struct fuse2fs *ff, ext2_ino_t ino, off_t len)
+static int do_truncate(struct fuse2fs *ff, const struct fuse_ctx *ctxt,
+		       ext2_ino_t ino, off_t len)
 {
 	int ret;
 
 	dbg_printf(ff, "%s: ino=%d len=%jd\n", __func__, ino, (intmax_t) len);
 
-	ret = check_inum_access(ff, ino, W_OK);
+	ret = check_inum_access(ff, ctxt, ino, W_OK);
 	if (ret)
 		return ret;
 
@@ -2195,8 +2196,8 @@ static void detect_linux_executable_open(int kernel_flags, int *access_check,
 }
 #endif /* __linux__ */
 
-static int __op_open(struct fuse2fs *ff, ext2_ino_t ino,
-		     struct fuse_file_info *fp)
+static int do_open(struct fuse2fs *ff, const struct fuse_ctx *ctxt,
+		   ext2_ino_t ino, struct fuse_file_info *fp)
 {
 	ext2_filsys fs = ff->fs;
 	errcode_t err;
@@ -2241,7 +2242,7 @@ static int __op_open(struct fuse2fs *ff, ext2_ino_t ino,
 
 	dbg_printf(ff, "%s: ino=%d\n", __func__, file->ino);
 
-	ret = check_inum_access(ff, file->ino, check);
+	ret = check_inum_access(ff, ctxt, file->ino, check);
 	if (ret) {
 		/*
 		 * In a regular (Linux) fs driver, the kernel will open
@@ -2253,7 +2254,7 @@ static int __op_open(struct fuse2fs *ff, ext2_ino_t ino,
 		 * also employ undocumented hacks (see above).
 		 */
 		if (check == R_OK) {
-			ret = check_inum_access(ff, file->ino, X_OK);
+			ret = check_inum_access(ff, ctxt, file->ino, X_OK);
 			if (ret)
 				goto out;
 		} else
@@ -2277,14 +2278,14 @@ out:
 
 static void op_open(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fp)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_ino_t ino = fuse_to_ext2_ino(fino);
 	int ret;
 
 	FUSE4FS_CHECK_CONTEXT(ff, req);
 	pthread_mutex_lock(&ff->bfl);
-	ret = __op_open(ff, ino, fp);
+	ret = do_open(ff, ctxt, ino, fp);
 	pthread_mutex_unlock(&ff->bfl);
 
 	if (ret)
@@ -2296,7 +2297,7 @@ static void op_open(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fp)
 static void op_read(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 		    size_t len, off_t offset, struct fuse_file_info *fp)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	struct fuse2fs_file_handle *fh =
 		(struct fuse2fs_file_handle *)(uintptr_t)fp->fh;
@@ -2367,7 +2368,7 @@ static void op_write(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 		     const char *buf, size_t len, off_t offset,
 		     struct fuse_file_info *fp)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	struct fuse2fs_file_handle *fh =
 		(struct fuse2fs_file_handle *)(uintptr_t)fp->fh;
@@ -2443,7 +2444,7 @@ out:
 static void op_release(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 		       struct fuse_file_info *fp)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	struct fuse2fs_file_handle *fh =
 		(struct fuse2fs_file_handle *)(uintptr_t)fp->fh;
@@ -2473,7 +2474,7 @@ static void op_fsync(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 		     int datasync EXT2FS_ATTR((unused)),
 		     struct fuse_file_info *fp)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	struct fuse2fs_file_handle *fh =
 		(struct fuse2fs_file_handle *)(uintptr_t)fp->fh;
@@ -2499,7 +2500,7 @@ static void op_fsync(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 
 static void op_statfs(fuse_req_t req, fuse_ino_t ino EXT2FS_ATTR((unused)))
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	uint64_t fsid, *f;
@@ -2574,7 +2575,7 @@ static int validate_xattr_name(const char *name)
 static void op_getxattr(fuse_req_t req, fuse_ino_t fino, const char *key,
 			size_t len)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	void *ptr = NULL;
@@ -2598,7 +2599,7 @@ static void op_getxattr(fuse_req_t req, fuse_ino_t fino, const char *key,
 
 	dbg_printf(ff, "%s: ino=%d name=%s\n", __func__, ino, key);
 
-	ret = check_inum_access(ff, ino, R_OK);
+	ret = check_inum_access(ff, ctxt, ino, R_OK);
 	if (ret)
 		goto out;
 
@@ -2650,7 +2651,7 @@ static int copy_names(char *name, char *value EXT2FS_ATTR((unused)),
 
 static void op_listxattr(fuse_req_t req, fuse_ino_t fino, size_t len)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	struct ext2_xattr_handle *h;
@@ -2670,7 +2671,7 @@ static void op_listxattr(fuse_req_t req, fuse_ino_t fino, size_t len)
 
 	dbg_printf(ff, "%s: ino=%d\n", __func__, ino);
 
-	ret = check_inum_access(ff, ino, R_OK);
+	ret = check_inum_access(ff, ctxt, ino, R_OK);
 	if (ret)
 		goto out;
 
@@ -2733,7 +2734,7 @@ out:
 static void op_setxattr(fuse_req_t req, fuse_ino_t fino, const char *key,
 			const char *value, size_t len, int flags)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	struct ext2_xattr_handle *h;
@@ -2761,7 +2762,7 @@ static void op_setxattr(fuse_req_t req, fuse_ino_t fino, const char *key,
 
 	dbg_printf(ff, "%s: ino=%d name=%s\n", __func__, ino, key);
 
-	ret = check_inum_access(ff, ino, W_OK);
+	ret = check_inum_access(ff, ctxt, ino, W_OK);
 	if (ret == -EACCES) {
 		ret = -EPERM;
 		goto out;
@@ -2823,7 +2824,7 @@ out:
 
 static void op_removexattr(fuse_req_t req, fuse_ino_t fino, const char *key)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	struct ext2_xattr_handle *h;
@@ -2862,7 +2863,7 @@ static void op_removexattr(fuse_req_t req, fuse_ino_t fino, const char *key)
 
 	dbg_printf(ff, "%s: ino=%d name=%s\n", __func__, ino, key);
 
-	ret = check_inum_access(ff, ino, W_OK);
+	ret = check_inum_access(ff, ctxt, ino, W_OK);
 	if (ret)
 		goto out;
 
@@ -2994,7 +2995,7 @@ static int op_readdir_iter(ext2_ino_t dir EXT2FS_ATTR((unused)),
 static void op_readdir(fuse_req_t req, fuse_ino_t fino, size_t size,
 		       off_t offset, struct fuse_file_info *fp)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	struct fuse2fs_file_handle *fh =
 		(struct fuse2fs_file_handle *)(uintptr_t)fp->fh;
@@ -3051,7 +3052,7 @@ out:
 
 static void op_access(fuse_req_t req, fuse_ino_t fino, int mask)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	ext2_ino_t ino = fuse_to_ext2_ino(fino);
@@ -3062,7 +3063,7 @@ static void op_access(fuse_req_t req, fuse_ino_t fino, int mask)
 	dbg_printf(ff, "%s: ino=%d mask=0x%x\n", __func__, ino, mask);
 	pthread_mutex_lock(&ff->bfl);
 
-	ret = check_inum_access(ff, ino, mask);
+	ret = check_inum_access(ff, ctxt, ino, mask);
 
 	pthread_mutex_unlock(&ff->bfl);
 	fuse_reply_err(req, -ret);
@@ -3071,7 +3072,7 @@ static void op_access(fuse_req_t req, fuse_ino_t fino, int mask)
 static void op_create(fuse_req_t req, fuse_ino_t pino, const char *name,
 		      mode_t mode, struct fuse_file_info *fp)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	ext2_ino_t parent = fuse_to_ext2_ino(pino), child;
@@ -3092,7 +3093,7 @@ static void op_create(fuse_req_t req, fuse_ino_t pino, const char *name,
 		goto out2;
 	}
 
-	ret = check_inum_access(ff, parent, A_OK | W_OK);
+	ret = check_inum_access(ff, ctxt, parent, A_OK | W_OK);
 	if (ret)
 		goto out2;
 
@@ -3160,7 +3161,7 @@ static void op_create(fuse_req_t req, fuse_ino_t pino, const char *name,
 	if (ret)
 		goto out2;
 
-	ret = __op_open(ff, child, fp);
+	ret = do_open(ff, ctxt, child, fp);
 	if (ret)
 		goto out2;
 
@@ -3186,7 +3187,8 @@ out2:
 
 
 
-static int do_utimens(struct fuse2fs *ff, ext2_ino_t ino, const struct timespec ctv[2],
+static int do_utimens(struct fuse2fs *ff, const struct fuse_ctx *ctxt,
+		      ext2_ino_t ino, const struct timespec ctv[2],
 		      struct ext2_inode_large *inode)
 {
 	struct timespec tv[2];
@@ -3204,7 +3206,7 @@ static int do_utimens(struct fuse2fs *ff, ext2_ino_t ino, const struct timespec 
 	 */
 	if (ctv[0].tv_nsec == UTIME_NOW && ctv[1].tv_nsec == UTIME_NOW)
 		access |= A_OK;
-	ret = check_inum_access(ff, ino, access);
+	ret = check_inum_access(ff, ctxt, ino, access);
 	if (ret)
 		return ret;
 
@@ -3257,15 +3259,14 @@ static int ioctl_getflags(struct fuse2fs *ff, struct fuse2fs_file_handle *fh,
 	return 0;
 }
 
-static int ioctl_setflags(struct fuse2fs *ff, struct fuse2fs_file_handle *fh,
-			  const void *data)
+static int ioctl_setflags(struct fuse2fs *ff, const struct fuse_ctx *ctxt,
+			  struct fuse2fs_file_handle *fh, const void *data)
 {
 	ext2_filsys fs = ff->fs;
 	errcode_t err;
 	struct ext2_inode_large inode;
 	int ret;
 	__u32 flags = *(__u32 *)data;
-	struct fuse_context *ctxt = fuse_get_context();
 
 	FUSE2FS_CHECK_MAGIC(fs, fh, FUSE2FS_FILE_MAGIC);
 	dbg_printf(ff, "%s: ino=%d\n", __func__, fh->ino);
@@ -3308,15 +3309,14 @@ static int ioctl_getversion(struct fuse2fs *ff, struct fuse2fs_file_handle *fh,
 	return 0;
 }
 
-static int ioctl_setversion(struct fuse2fs *ff, struct fuse2fs_file_handle *fh,
-			    const void *data)
+static int ioctl_setversion(struct fuse2fs *ff, const struct fuse_ctx *ctxt,
+			    struct fuse2fs_file_handle *fh, const void *data)
 {
 	ext2_filsys fs = ff->fs;
 	errcode_t err;
 	struct ext2_inode_large inode;
 	int ret;
 	__u32 generation = *(__u32 *)data;
-	struct fuse_context *ctxt = fuse_get_context();
 
 	FUSE2FS_CHECK_MAGIC(fs, fh, FUSE2FS_FILE_MAGIC);
 	dbg_printf(ff, "%s: ino=%d\n", __func__, fh->ino);
@@ -3407,14 +3407,13 @@ static __u32 fsxflags_to_iflags(__u32 xflags)
 	return iflags;
 }
 
-static int ioctl_fssetxattr(struct fuse2fs *ff, struct fuse2fs_file_handle *fh,
-			    const void *data)
+static int ioctl_fssetxattr(struct fuse2fs *ff, const struct fuse_ctx *ctxt,
+			    struct fuse2fs_file_handle *fh, const void *data)
 {
 	ext2_filsys fs = ff->fs;
 	errcode_t err;
 	struct ext2_inode_large inode;
 	int ret;
-	struct fuse_context *ctxt = fuse_get_context();
 	const struct fsxattr *fsx = data;
 	__u32 flags = fsxflags_to_iflags(fsx->fsx_xflags);
 	unsigned int inode_size;
@@ -3528,7 +3527,7 @@ static void op_ioctl(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 		     const void *in_buf, size_t in_bufsz EXT2FS_ATTR((unused)),
 		     size_t out_bufsz EXT2FS_ATTR((unused)))
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	struct fuse2fs_file_handle *fh =
 		(struct fuse2fs_file_handle *)(uintptr_t)fp->fh;
@@ -3544,13 +3543,13 @@ static void op_ioctl(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 		ret = ioctl_getflags(ff, fh, &get_data);
 		break;
 	case EXT2_IOC_SETFLAGS:
-		ret = ioctl_setflags(ff, fh, in_buf);
+		ret = ioctl_setflags(ff, ctxt, fh, in_buf);
 		break;
 	case EXT2_IOC_GETVERSION:
 		ret = ioctl_getversion(ff, fh, &get_data);
 		break;
 	case EXT2_IOC_SETVERSION:
-		ret = ioctl_setversion(ff, fh, in_buf);
+		ret = ioctl_setversion(ff, ctxt, fh, in_buf);
 		break;
 #endif
 #ifdef FS_IOC_FSGETXATTR
@@ -3558,7 +3557,7 @@ static void op_ioctl(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 		ret = ioctl_fsgetxattr(ff, fh, &fsx_data);
 		break;
 	case FS_IOC_FSSETXATTR:
-		ret = ioctl_fssetxattr(ff, fh, in_buf);
+		ret = ioctl_fssetxattr(ff, ctxt, fh, in_buf);
 		break;
 #endif
 #ifdef FITRIM
@@ -3599,7 +3598,7 @@ static void op_ioctl(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
 static void op_setattr(fuse_req_t req, fuse_ino_t fino, struct stat *attr,
 		       int to_set, struct fuse_file_info *fi EXT2FS_ATTR((unused)))
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	ext2_ino_t ino = fuse_to_ext2_ino(fino);
@@ -3622,7 +3621,7 @@ static void op_setattr(fuse_req_t req, fuse_ino_t fino, struct stat *attr,
 
 	/* Handle mode change using helper */
 	if (to_set & FUSE_SET_ATTR_MODE) {
-		ret = do_chmod(req, ff, ino, attr->st_mode, &inode);
+		ret = do_chmod(ff, ctxt, ino, attr->st_mode, &inode);
 		if (ret)
 			goto out;
 	}
@@ -3632,7 +3631,7 @@ static void op_setattr(fuse_req_t req, fuse_ino_t fino, struct stat *attr,
 		uid_t owner = (to_set & FUSE_SET_ATTR_UID) ? attr->st_uid : (uid_t)~0;
 		gid_t group = (to_set & FUSE_SET_ATTR_GID) ? attr->st_gid : (gid_t)~0;
 
-		ret = do_chown(ff, ino, owner, group, &inode);
+		ret = do_chown(ff, ctxt, ino, owner, group, &inode);
 		if (ret)
 			goto out;
 	}
@@ -3646,7 +3645,7 @@ static void op_setattr(fuse_req_t req, fuse_ino_t fino, struct stat *attr,
 			goto out;
 		}
 
-		ret = do_truncate(ff, ino, new_size);
+		ret = do_truncate(ff, ctxt, ino, new_size);
 		if (ret)
 			goto out;
 
@@ -3680,7 +3679,7 @@ static void op_setattr(fuse_req_t req, fuse_ino_t fino, struct stat *attr,
 			EXT4_INODE_GET_XTIME(i_mtime, &tv[1], &inode);
 		}
 
-		ret = do_utimens(ff, ino, tv, &inode);
+		ret = do_utimens(ff, ctxt, ino, tv, &inode);
 		if (ret)
 			goto out;
 	}
@@ -3711,7 +3710,7 @@ out:
 static void op_bmap(fuse_req_t req, fuse_ino_t fino,
 		    size_t blocksize EXT2FS_ATTR((unused)), uint64_t idx)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs;
 	ext2_ino_t ino = fuse_to_ext2_ino(fino);
@@ -3951,7 +3950,7 @@ static int zero_helper(fuse_req_t req, struct fuse_file_info *fp, int mode,
 static void op_fallocate(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)), int mode,
 			 off_t offset, off_t len, struct fuse_file_info *fp)
 {
-	struct fuse_context *ctxt = fuse_get_context();
+	const struct fuse_ctx *ctxt = fuse_req_ctx(req);
 	struct fuse2fs *ff = fuse2fs_req_ctx(req);
 	ext2_filsys fs = ff->fs;
 	int ret;
