@@ -2236,9 +2236,8 @@ static void op_open(fuse_req_t req, fuse_ino_t fino, struct fuse_file_info *fp)
 		fuse_reply_open(req, fp);
 }
 
-static int op_read(const char *path EXT2FS_ATTR((unused)), char *buf,
-		   size_t len, off_t offset,
-		   struct fuse_file_info *fp)
+static void op_read(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
+		    size_t len, off_t offset, struct fuse_file_info *fp)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
@@ -2248,13 +2247,21 @@ static int op_read(const char *path EXT2FS_ATTR((unused)), char *buf,
 	ext2_file_t efp;
 	errcode_t err;
 	unsigned int got = 0;
+	char *buf;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	FUSE2FS_CHECK_MAGIC(fs, fh, FUSE2FS_FILE_MAGIC);
+	FUSE4FS_CHECK_FH(fs, fh, req);
 	dbg_printf(ff, "%s: ino=%d off=%jd len=%jd\n", __func__, fh->ino,
 		   (intmax_t) offset, len);
+
+	err = ext2fs_get_mem(len, &buf);
+	if (err) {
+		fuse_reply_err(req, ENOMEM);
+		return;
+	}
+
 	pthread_mutex_lock(&ff->bfl);
 	err = ext2fs_file_open(fs, fh->ino, fh->open_flags, &efp);
 	if (err) {
@@ -2290,12 +2297,18 @@ out2:
 	}
 out:
 	pthread_mutex_unlock(&ff->bfl);
-	return got ? (int) got : ret;
+
+	if (ret)
+		fuse_reply_err(req, -ret);
+	else
+		fuse_reply_buf(req, buf, got);
+
+	ext2fs_free_mem(&buf);
 }
 
-static int op_write(const char *path EXT2FS_ATTR((unused)),
-		    const char *buf, size_t len, off_t offset,
-		    struct fuse_file_info *fp)
+static void op_write(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
+		     const char *buf, size_t len, off_t offset,
+		     struct fuse_file_info *fp)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
@@ -2307,9 +2320,9 @@ static int op_write(const char *path EXT2FS_ATTR((unused)),
 	unsigned int got = 0;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
-	FUSE2FS_CHECK_MAGIC(fs, fh, FUSE2FS_FILE_MAGIC);
+	FUSE4FS_CHECK_FH(fs, fh, req);
 	dbg_printf(ff, "%s: ino=%d off=%jd len=%jd\n", __func__, fh->ino,
 		   (intmax_t) offset, (intmax_t) len);
 	pthread_mutex_lock(&ff->bfl);
@@ -2363,7 +2376,11 @@ out2:
 
 out:
 	pthread_mutex_unlock(&ff->bfl);
-	return got ? (int) got : ret;
+
+	if (ret)
+		fuse_reply_err(req, -ret);
+	else
+		fuse_reply_write(req, got);
 }
 
 static void op_release(fuse_req_t req, fuse_ino_t fino EXT2FS_ATTR((unused)),
@@ -2842,9 +2859,14 @@ out:
 }
 
 struct readdir_iter {
-	void *buf;
+	char *buf;
+	size_t size;
+	size_t used;
 	ext2_filsys fs;
-	fuse_fill_dir_t func;
+	fuse_req_t req;
+	off_t offset;
+	off_t start_offset;
+	int error;
 };
 
 static inline mode_t dirent_fmode(ext2_filsys fs,
@@ -2886,38 +2908,67 @@ static int op_readdir_iter(ext2_ino_t dir EXT2FS_ATTR((unused)),
 		.st_ino = dirent->inode,
 		.st_mode = dirent_fmode(i->fs, dirent),
 	};
-	int ret;
+	size_t entrysize;
+
+	/* Skip entries until we reach the requested offset */
+	if (i->offset < i->start_offset) {
+		i->offset++;
+		return 0;
+	}
 
 	memcpy(namebuf, dirent->name, dirent->name_len & 0xFF);
 	namebuf[dirent->name_len & 0xFF] = 0;
-	ret = i->func(i->buf, namebuf, &stat, 0, 0);
-	if (ret)
+
+	entrysize = fuse_add_direntry(i->req, i->buf + i->used,
+				      i->size - i->used, namebuf, &stat,
+				      i->offset + 1);
+
+	if (entrysize > i->size - i->used) {
+		/* Buffer is full */
 		return DIRENT_ABORT;
+	}
+
+	i->used += entrysize;
+	i->offset++;
 
 	return 0;
 }
 
-static int op_readdir(const char *path EXT2FS_ATTR((unused)),
-		      void *buf, fuse_fill_dir_t fill_func,
-		      off_t offset EXT2FS_ATTR((unused)),
-		      struct fuse_file_info *fp,
-		      enum fuse_readdir_flags flags EXT2FS_ATTR((unused)))
+static void op_readdir(fuse_req_t req, fuse_ino_t fino, size_t size,
+		       off_t offset, struct fuse_file_info *fp)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	struct fuse2fs_file_handle *fh =
 		(struct fuse2fs_file_handle *)(uintptr_t)fp->fh;
+	ext2_ino_t ino = (ext2_ino_t)fino;
 	errcode_t err;
 	struct readdir_iter i;
+	char *buf;
 	int ret = 0;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
-	i.fs = ff->fs;
-	FUSE2FS_CHECK_MAGIC(i.fs, fh, FUSE2FS_FILE_MAGIC);
-	dbg_printf(ff, "%s: ino=%d\n", __func__, fh->ino);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
+	FUSE4FS_CHECK_FH(ff->fs, fh, req);
+	dbg_printf(ff, "%s: ino=%d offset=%jd size=%zu\n", __func__,
+		   fh->ino, (intmax_t)offset, size);
+
+	err = ext2fs_get_mem(size, &buf);
+	if (err) {
+		fuse_reply_err(req, ENOMEM);
+		return;
+	}
+
 	pthread_mutex_lock(&ff->bfl);
+
 	i.buf = buf;
-	i.func = fill_func;
+	i.size = size;
+	i.used = 0;
+	i.fs = ff->fs;
+	i.req = req;
+	i.offset = 0;
+	i.start_offset = offset;
+	i.error = 0;
+
 	err = ext2fs_dir_iterate2(i.fs, fh->ino, 0, NULL, op_readdir_iter, &i);
 	if (err) {
 		ret = translate_error(i.fs, fh->ino, err);
@@ -2929,9 +2980,16 @@ static int op_readdir(const char *path EXT2FS_ATTR((unused)),
 		if (ret)
 			goto out;
 	}
+
 out:
 	pthread_mutex_unlock(&ff->bfl);
-	return ret;
+
+	if (ret)
+		fuse_reply_err(req, -ret);
+	else
+		fuse_reply_buf(req, buf, i.used);
+
+	ext2fs_free_mem(&buf);
 }
 
 static void op_access(fuse_req_t req, fuse_ino_t fino, int mask)
@@ -3888,6 +3946,9 @@ static struct fuse_lowlevel_ops ll_ops = {
 	.open = op_open,
 	.opendir = op_open,
 	.create = op_create,
+	.read = op_read,
+	.write = op_write,
+	.readdir = op_readdir,
 	.release = op_release,
 	.releasedir = op_release,
 	.fsync = op_fsync,
@@ -3902,9 +3963,6 @@ static struct fuse_lowlevel_ops ll_ops = {
 };
 
 static struct fuse_operations fs_ops = {
-	.read = op_read,
-	.write = op_write,
-	.readdir = op_readdir,
 };
 
 static int get_random_bytes(void *p, size_t sz)
