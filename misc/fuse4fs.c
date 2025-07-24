@@ -215,6 +215,11 @@ struct fuse2fs {
 	return translate_error(global_fs, 0, EXT2_ET_FILESYSTEM_CORRUPTED); \
 } while (0)
 
+#define FUSE4FS_CHECK_CONTEXT(ptr, req) do {if ((ptr)->magic != FUSE2FS_MAGIC) { \
+	fuse_reply_err(req, -translate_error(global_fs, 0, EXT2_ET_FILESYSTEM_CORRUPTED)); \
+	return; \
+}} while (0)
+
 static int __translate_error(ext2_filsys fs, ext2_ino_t ino, errcode_t err,
 			     const char *file, int line);
 #define translate_error(fs, ino, err) __translate_error((fs), (ino), (err), \
@@ -1295,45 +1300,6 @@ out:
 	return ret;
 }
 
-static int unlink_file_by_name(struct fuse2fs *ff, const char *path)
-{
-	ext2_filsys fs = ff->fs;
-	errcode_t err;
-	ext2_ino_t dir;
-	char *filename = strdup(path);
-	char *base_name;
-	int ret;
-
-	base_name = strrchr(filename, '/');
-	if (base_name) {
-		*base_name++ = '\0';
-		err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, filename,
-				   &dir);
-		if (err) {
-			free(filename);
-			return translate_error(fs, 0, err);
-		}
-	} else {
-		dir = EXT2_ROOT_INO;
-		base_name = filename;
-	}
-
-	ret = check_inum_access(ff, dir, W_OK);
-	if (ret) {
-		free(filename);
-		return ret;
-	}
-
-	dbg_printf(ff, "%s: unlinking name=%s from dir=%d\n", __func__,
-		   base_name, dir);
-	err = ext2fs_unlink(fs, dir, base_name, 0, 0);
-	free(filename);
-	if (err)
-		return translate_error(fs, dir, err);
-
-	return update_mtime(fs, dir, NULL);
-}
-
 static errcode_t remove_ea_inodes(struct fuse2fs *ff, ext2_ino_t ino,
 				  struct ext2_inode_large *inode)
 {
@@ -1434,14 +1400,15 @@ out:
 	return ret;
 }
 
-static int __op_unlink(struct fuse2fs *ff, const char *path)
+static int __op_unlink(struct fuse2fs *ff, ext2_ino_t parent, const char *name)
 {
 	ext2_filsys fs = ff->fs;
 	ext2_ino_t ino;
 	errcode_t err;
 	int ret = 0;
 
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &ino);
+	/* Get the inode number for the file */
+	err = ext2fs_namei(fs, EXT2_ROOT_INO, parent, name, &ino);
 	if (err) {
 		ret = translate_error(fs, 0, err);
 		goto out;
@@ -1451,28 +1418,39 @@ static int __op_unlink(struct fuse2fs *ff, const char *path)
 	if (ret)
 		goto out;
 
-	ret = unlink_file_by_name(ff, path);
+	ret = check_inum_access(ff, parent, W_OK);
+	if (ret)
+		goto out;
+
+	dbg_printf(ff, "%s: unlinking name=%s from dir=%d\n", __func__,
+		   name, parent);
+	err = ext2fs_unlink(fs, parent, name, 0, 0);
+	if (err) {
+		ret = translate_error(fs, parent, err);
+		goto out;
+	}
+
+	ret = update_mtime(fs, parent, NULL);
 	if (ret)
 		goto out;
 
 	ret = remove_inode(ff, ino);
-	if (ret)
-		goto out;
 out:
 	return ret;
 }
 
-static int op_unlink(const char *path)
+static void op_unlink(fuse_req_t req, fuse_ino_t pino, const char *name)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
+	ext2_ino_t parent = (ext2_ino_t)pino;
 	int ret;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	pthread_mutex_lock(&ff->bfl);
-	ret = __op_unlink(ff, path);
+	ret = __op_unlink(ff, parent, name);
 	pthread_mutex_unlock(&ff->bfl);
-	return ret;
+	fuse_reply_err(req, -ret);
 }
 
 struct rd_struct {
@@ -1503,7 +1481,7 @@ static int rmdir_proc(ext2_ino_t dir EXT2FS_ATTR((unused)),
 	return 0;
 }
 
-static int __op_rmdir(struct fuse2fs *ff, const char *path)
+static int __op_rmdir(struct fuse2fs *ff, ext2_ino_t parent, const char *name)
 {
 	ext2_filsys fs = ff->fs;
 	ext2_ino_t child;
@@ -1512,12 +1490,12 @@ static int __op_rmdir(struct fuse2fs *ff, const char *path)
 	struct rd_struct rds;
 	int ret = 0;
 
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, path, &child);
+	err = ext2fs_namei(fs, EXT2_ROOT_INO, parent, name, &child);
 	if (err) {
 		ret = translate_error(fs, 0, err);
 		goto out;
 	}
-	dbg_printf(ff, "%s: rmdir path=%s ino=%d\n", __func__, path, child);
+	dbg_printf(ff, "%s: rmdir name=%s ino=%d\n", __func__, name, child);
 
 	ret = check_inum_access(ff, child, W_OK);
 	if (ret)
@@ -1533,12 +1511,12 @@ static int __op_rmdir(struct fuse2fs *ff, const char *path)
 	}
 
 	/* the kernel checks parent permissions before emptiness */
-	if (rds.parent == 0) {
+	if (rds.parent != parent) {
 		ret = translate_error(fs, child, EXT2_ET_FILESYSTEM_CORRUPTED);
 		goto out;
 	}
 
-	ret = check_inum_access(ff, rds.parent, W_OK);
+	ret = check_inum_access(ff, parent, W_OK);
 	if (ret)
 		goto out;
 
@@ -1547,9 +1525,18 @@ static int __op_rmdir(struct fuse2fs *ff, const char *path)
 		goto out;
 	}
 
-	ret = unlink_file_by_name(ff, path);
+	dbg_printf(ff, "%s: unlinking name=%s from dir=%d\n", __func__,
+		   name, parent);
+	err = ext2fs_unlink(fs, parent, name, 0, 0);
+	if (err) {
+		ret = translate_error(fs, parent, err);
+		goto out;
+	}
+
+	ret = update_mtime(fs, parent, NULL);
 	if (ret)
 		goto out;
+
 	/* Directories have to be "removed" twice. */
 	ret = remove_inode(ff, child);
 	if (ret)
@@ -1582,17 +1569,18 @@ out:
 	return ret;
 }
 
-static int op_rmdir(const char *path)
+static void op_rmdir(fuse_req_t req, fuse_ino_t pino, const char *name)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
+	ext2_ino_t parent = (ext2_ino_t)pino;
 	int ret;
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	pthread_mutex_lock(&ff->bfl);
-	ret = __op_rmdir(ff, path);
+	ret = __op_rmdir(ff, parent, name);
 	pthread_mutex_unlock(&ff->bfl);
-	return ret;
+	fuse_reply_err(req, -ret);
 }
 
 static int op_symlink(const char *src, const char *dest)
@@ -1717,25 +1705,26 @@ static int update_dotdot_helper(ext2_ino_t dir EXT2FS_ATTR((unused)),
 	return 0;
 }
 
-static int op_rename(const char *from, const char *to,
-		     unsigned int flags EXT2FS_ATTR((unused)))
+static void op_rename(fuse_req_t req, fuse_ino_t from_parent, const char *from,
+		      fuse_ino_t to_parent, const char *to, unsigned int flags)
 {
 	struct fuse_context *ctxt = fuse_get_context();
 	struct fuse2fs *ff = (struct fuse2fs *)ctxt->private_data;
 	ext2_filsys fs;
 	errcode_t err;
-	ext2_ino_t from_ino, to_ino, to_dir_ino, from_dir_ino;
-	char *temp_to = NULL, *temp_from = NULL;
-	char *cp, a;
+	ext2_ino_t from_ino, from_dir_ino = (ext2_ino_t)from_parent;
+	ext2_ino_t to_ino, to_dir_ino = (ext2_ino_t)to_parent;
 	struct ext2_inode inode;
 	struct update_dotdot ud;
 	int ret = 0;
 
 	/* renameat2 is not supported */
-	if (flags)
-		return -ENOSYS;
+	if (flags) {
+		fuse_reply_err(req, EINVAL);
+		return;
+	}
 
-	FUSE2FS_CHECK_CONTEXT(ff);
+	FUSE4FS_CHECK_CONTEXT(ff, req);
 	fs = ff->fs;
 	dbg_printf(ff, "%s: renaming %s to %s\n", __func__, from, to);
 	pthread_mutex_lock(&ff->bfl);
@@ -1744,13 +1733,13 @@ static int op_rename(const char *from, const char *to,
 		goto out;
 	}
 
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, from, &from_ino);
+	err = ext2fs_namei(fs, EXT2_ROOT_INO, from_dir_ino, from, &from_ino);
 	if (err || from_ino == 0) {
 		ret = translate_error(fs, 0, err);
 		goto out;
 	}
 
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, to, &to_ino);
+	err = ext2fs_namei(fs, EXT2_ROOT_INO, to_dir_ino, to, &to_ino);
 	if (err && err != EXT2_ET_FILE_NOT_FOUND) {
 		ret = translate_error(fs, 0, err);
 		goto out;
@@ -1775,109 +1764,55 @@ static int op_rename(const char *from, const char *to,
 			goto out;
 	}
 
-	temp_to = strdup(to);
-	if (!temp_to) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	temp_from = strdup(from);
-	if (!temp_from) {
-		ret = -ENOMEM;
-		goto out2;
-	}
-
-	/* Find parent dir of the source and check write access */
-	cp = strrchr(temp_from, '/');
-	if (!cp) {
-		ret = -EINVAL;
-		goto out2;
-	}
-
-	a = *(cp + 1);
-	*(cp + 1) = 0;
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, temp_from,
-			   &from_dir_ino);
-	*(cp + 1) = a;
-	if (err) {
-		ret = translate_error(fs, 0, err);
-		goto out2;
-	}
-	if (from_dir_ino == 0) {
-		ret = -ENOENT;
-		goto out2;
-	}
-
 	ret = check_inum_access(ff, from_dir_ino, W_OK);
 	if (ret)
-		goto out2;
-
-	/* Find parent dir of the destination and check write access */
-	cp = strrchr(temp_to, '/');
-	if (!cp) {
-		ret = -EINVAL;
-		goto out2;
-	}
-
-	a = *(cp + 1);
-	*(cp + 1) = 0;
-	err = ext2fs_namei(fs, EXT2_ROOT_INO, EXT2_ROOT_INO, temp_to,
-			   &to_dir_ino);
-	*(cp + 1) = a;
-	if (err) {
-		ret = translate_error(fs, 0, err);
-		goto out2;
-	}
-	if (to_dir_ino == 0) {
-		ret = -ENOENT;
-		goto out2;
-	}
+		goto out;
 
 	ret = check_inum_access(ff, to_dir_ino, W_OK);
 	if (ret)
-		goto out2;
+		goto out;
 
 	/* If the target exists, unlink it first */
 	if (to_ino != 0) {
 		err = ext2fs_read_inode(fs, to_ino, &inode);
 		if (err) {
 			ret = translate_error(fs, to_ino, err);
-			goto out2;
+			goto out;
 		}
 
 		dbg_printf(ff, "%s: unlinking %s ino=%d\n", __func__,
 			   LINUX_S_ISDIR(inode.i_mode) ? "dir" : "file",
 			   to_ino);
 		if (LINUX_S_ISDIR(inode.i_mode))
-			ret = __op_rmdir(ff, to);
+			ret = __op_rmdir(ff, to_dir_ino, to);
 		else
-			ret = __op_unlink(ff, to);
+			ret = __op_unlink(ff, to_dir_ino, to);
 		if (ret)
-			goto out2;
+			goto out;
 	}
 
 	/* Get ready to do the move */
 	err = ext2fs_read_inode(fs, from_ino, &inode);
 	if (err) {
 		ret = translate_error(fs, from_ino, err);
-		goto out2;
+		goto out;
 	}
 
 	/* Link in the new file */
 	dbg_printf(ff, "%s: linking ino=%d/path=%s to dir=%d\n", __func__,
-		   from_ino, cp + 1, to_dir_ino);
-	err = ext2fs_link(fs, to_dir_ino, cp + 1, from_ino,
+		   from_ino, to, to_dir_ino);
+	err = ext2fs_link(fs, to_dir_ino, to, from_ino,
 			  ext2_file_type(inode.i_mode) | EXT2FS_LINK_EXPAND);
 	if (err) {
 		ret = translate_error(fs, to_dir_ino, err);
-		goto out2;
+		goto out;
 	}
 
 	/* Update '..' pointer if dir */
 	err = ext2fs_read_inode(fs, from_ino, &inode);
 	if (err) {
 		ret = translate_error(fs, from_ino, err);
-		goto out2;
+		goto out;
 	}
 
 	if (LINUX_S_ISDIR(inode.i_mode)) {
@@ -1888,7 +1823,7 @@ static int op_rename(const char *from, const char *to,
 					  update_dotdot_helper, &ud);
 		if (err) {
 			ret = translate_error(fs, from_ino, err);
-			goto out2;
+			goto out;
 		}
 
 		/* Decrease from_dir_ino's links_count */
@@ -1897,54 +1832,59 @@ static int op_rename(const char *from, const char *to,
 		err = ext2fs_read_inode(fs, from_dir_ino, &inode);
 		if (err) {
 			ret = translate_error(fs, from_dir_ino, err);
-			goto out2;
+			goto out;
 		}
 		inode.i_links_count--;
 		err = ext2fs_write_inode(fs, from_dir_ino, &inode);
 		if (err) {
 			ret = translate_error(fs, from_dir_ino, err);
-			goto out2;
+			goto out;
 		}
 
 		/* Increase to_dir_ino's links_count */
 		err = ext2fs_read_inode(fs, to_dir_ino, &inode);
 		if (err) {
 			ret = translate_error(fs, to_dir_ino, err);
-			goto out2;
+			goto out;
 		}
 		inode.i_links_count++;
 		err = ext2fs_write_inode(fs, to_dir_ino, &inode);
 		if (err) {
 			ret = translate_error(fs, to_dir_ino, err);
-			goto out2;
+			goto out;
 		}
 	}
 
 	/* Update timestamps */
 	ret = update_ctime(fs, from_ino, NULL);
 	if (ret)
-		goto out2;
+		goto out;
 
 	ret = update_mtime(fs, to_dir_ino, NULL);
 	if (ret)
-		goto out2;
+		goto out;
 
 	/* Remove the old file */
-	ret = unlink_file_by_name(ff, from);
+	dbg_printf(ff, "%s: unlinking name=%s from dir=%d\n", __func__,
+		   from, from_dir_ino);
+	err = ext2fs_unlink(fs, from_dir_ino, from, 0, 0);
+	if (err) {
+		ret = translate_error(fs, from_dir_ino, err);
+		goto out;
+	}
+
+	ret = update_mtime(fs, from_dir_ino, NULL);
 	if (ret)
-		goto out2;
+		goto out;
 
 	/* Flush the whole mess out */
 	err = ext2fs_flush2(fs, 0);
 	if (err)
 		ret = translate_error(fs, 0, err);
 
-out2:
-	free(temp_from);
-	free(temp_to);
 out:
 	pthread_mutex_unlock(&ff->bfl);
-	return ret;
+	fuse_reply_err(req, -ret);
 }
 
 static int op_link(const char *src, const char *dest)
@@ -3997,6 +3937,12 @@ out:
 }
 # endif /* SUPPORT_FALLOCATE */
 
+static struct fuse_lowlevel_ops ll_ops = {
+	.unlink = op_unlink,
+	.rmdir = op_rmdir,
+	.rename = op_rename,
+};
+
 static struct fuse_operations fs_ops = {
 	.init = op_init,
 	.destroy = op_destroy,
@@ -4004,10 +3950,7 @@ static struct fuse_operations fs_ops = {
 	.readlink = op_readlink,
 	.mknod = op_mknod,
 	.mkdir = op_mkdir,
-	.unlink = op_unlink,
-	.rmdir = op_rmdir,
 	.symlink = op_symlink,
-	.rename = op_rename,
 	.link = op_link,
 	.chmod = op_chmod,
 	.chown = op_chown,
